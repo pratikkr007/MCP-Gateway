@@ -1,0 +1,46 @@
+
+replicaCount: 1
+
+image:
+  registry: docker.io
+  repository: wordpress
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: wordpress.local
+      paths:
+        - path: /
+          pathType: Prefix
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+storage:
+  requestedSize: 1Gi
+  className: standard
+  accessModes:
+    - ReadWriteOnce
+
+mariadb:
+  enabled: true
+  settings:
+    rootPassword: "LocalRootPass-ChangeMe-2026"
+  userDatabase:
+    name: wordpress
+    user: wpuser
+    password: "LocalWpPass-ChangeMe-2026"
+  storage:
+    requestedSize: 1Gi
+    className: standard

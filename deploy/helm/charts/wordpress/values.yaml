@@ -1,0 +1,35 @@
+
+wordpressUsername: admin
+wordpressBlogName: Team MCP Store
+
+service:
+  type: ClusterIP
+
+ingress:
+  enabled: true
+  ingressClassName: nginx
+  hostname: shop.localhost
+  path: /
+  pathType: Prefix
+  annotations: {}
+
+persistence:
+  enabled: true
+  size: 2Gi
+
+mariadb:
+  enabled: true
+  auth:
+    database: wordpress
+  primary:
+    persistence:
+      enabled: true
+      size: 2Gi
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
