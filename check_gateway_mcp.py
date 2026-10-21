@@ -17,9 +17,9 @@ async def main():
             await session.initialize()
 
             result = await session.call_tool(
-                "list_products",
-                {"search": "MCP Gateway Demo Product"},
-            )
+              "woocommerce__list_products",
+               {"search": "MCP Gateway Demo Product"},
+)
 
             print("Tool call completed.")
             print("Error:", result.isError)

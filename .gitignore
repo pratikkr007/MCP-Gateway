@@ -1,6 +1,15 @@
 
+# Environment variables and secrets
 .env
 .env.*
 !.env.example
 
+# Python virtual environment
+.venv/
+
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# Temporary Helm files
 temp-helm/
