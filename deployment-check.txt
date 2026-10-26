@@ -1,0 +1,244 @@
+========== HELM CHART STRUCTURE ==========
+
+FullName                                                                      Length
+--------                                                                      ------
+C:\Users\prati\Documents\mcp-gateway\deploy\helm\charts\wordpress\values.yaml    511
+
+
+
+
+========== EXISTING HELM RELEASES ==========
+NAME     	NAMESPACE	REVISION	UPDATED                              	STATUS  	CHART           	APP VERSION 
+wordpress	team-mcp 	1       	2026-10-20 00:05:43.2222498 +0530 IST	deployed	wordpress-0.16.7	7.1.3-apache
+
+========== EXISTING WORKLOADS AND STORAGE ==========
+NAMESPACE            NAME                                       READY   UP-TO-DATE   AVAILABLE   AGE
+ingress-nginx        deployment.apps/ingress-nginx-controller   1/1     1            1           4d17h
+kube-system          deployment.apps/coredns                    2/2     2            2           4d17h
+local-path-storage   deployment.apps/local-path-provisioner     1/1     1            1           4d17h
+team-mcp             deployment.apps/wordpress                  1/1     1            1           4d17h
+
+NAMESPACE   NAME                                 READY   AGE
+team-mcp    statefulset.apps/wordpress-mariadb   1/1     4d17h
+
+NAMESPACE       NAME                                         TYPE           CLUSTER-IP      EXTERNAL-IP   PORT(S)                      AGE
+default         service/kubernetes                           ClusterIP      10.96.0.1       <none>        443/TCP                      4d17h
+ingress-nginx   service/ingress-nginx-controller             LoadBalancer   10.96.71.0      <pending>     80:32248/TCP,443:32205/TCP   4d17h
+ingress-nginx   service/ingress-nginx-controller-admission   ClusterIP      10.96.169.59    <none>        443/TCP                      4d17h
+kube-system     service/kube-dns                             ClusterIP      10.96.0.10      <none>        53/UDP,53/TCP,9153/TCP       4d17h
+team-mcp        service/wordpress                            ClusterIP      10.96.132.249   <none>        80/TCP                       4d17h
+team-mcp        service/wordpress-mariadb                    ClusterIP      10.96.179.140   <none>        3306/TCP                     4d17h
+
+NAMESPACE   NAME                                  CLASS   HOSTS             ADDRESS     PORTS   AGE
+team-mcp    ingress.networking.k8s.io/wordpress   nginx   wordpress.local   localhost   80      4d17h
+
+NAMESPACE   NAME                                                  STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+team-mcp    persistentvolumeclaim/db-volume-wordpress-mariadb-0   Bound    pvc-34a4c5c5-3338-4414-a36e-87e03f317d65   1Gi        RWO            standard       <unset>                 4d17h
+team-mcp    persistentvolumeclaim/wordpress                       Bound    pvc-5488ce21-9404-455c-85c0-2c7c77dde749   1Gi        RWO            standard       <unset>                 4d17h
+
+========== DOCKER IMAGES ==========
+team-mcp-notes:local
+team-mcp-inventory:local
+team-mcp-woocommerce:local
+team-mcp-dashboard:local
+team-mcp-gateway:local
+
+========== FRONTEND NGINX CONFIG ==========
+server {
+    listen 8080;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+}
+
+========== BACKEND CONFIGURATION ==========
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import HTTPException
+
+import asyncio
+
+from fastapi import Request
+import httpx
+import json
+import inspect
+import logging
+import os
+import re
+import time
+from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+from mcp.server.fastmcp import FastMCP
+from pydantic import BaseModel, Field
+
+from backend.app.upstream_security import (
+    build_auth_headers,
+    validate_upstream_url as validate_secure_upstream_url,
+)
+
+from backend.app.security import (
+    GatewayAuthMiddleware,
+    init_db,
+    create_user,
+    issue_api_key,
+    revoke_api_key,
+    list_users,
+    update_user_role,
+    delete_user,
+    connect_db,
+    current_user_id,
+    current_user_role,
+    current_username,
+    write_audit,
+    load_upstreams,
+    save_upstream,
+    delete_upstream_record,
+)
+
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+load_dotenv(ROOT_DIR / ".env")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("mcp-gateway")
+
+DEFAULT_UPSTREAMS = {
+    "woocommerce": os.getenv(
+        "WOOCOMMERCE_MCP_URL",
+        "http://127.0.0.1:8000/mcp",
+    ),
+    "notes": os.getenv(
+        "NOTES_MCP_URL",
+        "http://127.0.0.1:8002/mcp",
+    ),
+    "inventory": os.getenv(
+        "INVENTORY_MCP_URL",
+        "http://127.0.0.1:8003/mcp",
+    ),
+}
+
+UPSTREAMS: dict[str, str] = {}
+UPSTREAM_ENABLED: dict[str, bool] = {}
+UPSTREAM_CONFIG: dict[str, dict[str, Any]] = {}
+UPSTREAM_FAILURES: dict[str, int] = {}
+
+UPSTREAM_CONNECT_TIMEOUT_SECONDS = int(
+    os.getenv("UPSTREAM_CONNECT_TIMEOUT_SECONDS", "5")
+)
+UPSTREAM_DISCOVERY_TIMEOUT_SECONDS = int(
+    os.getenv("UPSTREAM_DISCOVERY_TIMEOUT_SECONDS", "10")
+)
+UPSTREAM_TOOL_TIMEOUT_SECONDS = int(
+    os.getenv("UPSTREAM_TOOL_TIMEOUT_SECONDS", "20")
+)
+UPSTREAM_HEALTH_CHECK_INTERVAL_SECONDS = max(
+    5, int(os.getenv("UPSTREAM_HEALTH_CHECK_INTERVAL_SECONDS", "30"))
+)
+UPSTREAM_FAILURE_THRESHOLD = max(
+    1, int(os.getenv("UPSTREAM_FAILURE_THRESHOLD", "3"))
+)
+UPSTREAM_CIRCUIT_OPEN_SECONDS = max(
+    1, int(os.getenv("UPSTREAM_CIRCUIT_OPEN_SECONDS", "60"))
+)
+
+TOOL_ROUTES: dict[str, dict[str, str]] = {}
+REGISTRATION_LOCK = asyncio.Lock()
+
+
+# --------------------------------------------------
+# Gateway MCP server
+# --------------------------------------------------
+
+gateway_mcp = FastMCP(
+    "team-mcp-gateway",
+    host="0.0.0.0",
+    port=8081,
+    stateless_http=True,
+)
+
+
+# --------------------------------------------------
+# MCP upstream helpers
+# --------------------------------------------------
+
+def get_upstream_config(server_name: str) -> dict[str, Any]:
+    config = UPSTREAM_CONFIG.get(server_name)
+    if not config:
+        raise RuntimeError(f"Unknown upstream server: {server_name}")
+    if not config.get("enabled", False):
+        raise RuntimeError(f"Upstream '{server_name}' is disabled")
+    return config
+
+
+def get_upstream_headers(config: dict[str, Any]) -> dict[str, str]:
+    return build_auth_headers(
+        auth_mode=config.get("auth_mode", "none"),
+        credential=config.get("credential"),
+        custom_header_name=config.get("custom_header_name"),
+    )
+
+
+def circuit_is_open(config: dict[str, Any]) -> bool:
+    value = config.get("circuit_open_until")
+    if not value:
+        return False
+    try:
+        until = datetime.fromisoformat(value)
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) < until
+    except (TypeError, ValueError):
+        return False
+
+
+def update_upstream_status(
+    name: str,
+    status: str,
+    *,
+    error: str | None = None,
+    discovery_succeeded: bool = False,
+):
+    """Persist safe connection/health metadata without storing secrets."""
+    now = datetime.now(timezone.utc).isoformat()
+    config = UPSTREAM_CONFIG.get(name, {})
+    failures = UPSTREAM_FAILURES.get(
+        name, int(config.get("consecutive_failures") or 0)
+    )
+
+    if status == "connected":
+        failures = 0
+        circuit_open_until = None
+        last_success_at = now
+        last_error = None
+    elif status == "disabled":
+        failures = 0
+        circuit_open_until = None
+        last_success_at = config.get("last_success_at")
+        last_error = None
+    elif status == "circuit_open":
+        circuit_open_until = (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=UPSTREAM_CIRCUIT_OPEN_SECONDS)
+        ).isoformat()
+        last_success_at = config.get("last_success_at")
+        last_error = (error or "Circuit breaker open")[:500]

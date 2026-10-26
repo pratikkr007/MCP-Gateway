@@ -1,0 +1,103 @@
+
+{{- range $name, $svc := .Values.services }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/part-of: team-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $name }}
+        app.kubernetes.io/part-of: team-mcp
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: {{ $name }}
+          image: "{{ $svc.image.repository }}:{{ $svc.image.tag }}"
+          imagePullPolicy: {{ $.Values.imagePullPolicy | default "IfNotPresent" }}
+          ports:
+            - name: http
+              containerPort: {{ $svc.port }}
+
+          {{- if or $svc.env $svc.secretEnv }}
+          env:
+            {{- range $item := $svc.env }}
+            - name: {{ $item.name }}
+              value: {{ $item.value | quote }}
+            {{- end }}
+            {{- range $key := $svc.secretEnv }}
+            - name: {{ $key }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secret.name | default "team-mcp-secrets" }}
+                  key: {{ $key }}
+            {{- end }}
+            {{- if eq $name "woocommerce-mcp" }}
+            - name: WOOCOMMERCE_OAUTH_URL
+              value: {{ $.Values.woocommerceOAuthUrl | default "http://wordpress.local" | quote }}
+            {{- end }}
+          {{- end }}
+
+          {{- if and $svc.liveness (eq $svc.liveness.type "http") }}
+          livenessProbe:
+            httpGet:
+              path: {{ $svc.liveness.path }}
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          {{- else }}
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          {{- end }}
+
+          {{- if and $svc.readiness (eq $svc.readiness.type "http") }}
+          readinessProbe:
+            httpGet:
+              path: {{ $svc.readiness.path }}
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          {{- else }}
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          {{- end }}
+
+          resources:
+            {{- toYaml ($svc.resources | default $.Values.resources) | nindent 12 }}
+
+          {{- if and $.Values.persistence.enabled $svc.persistence }}
+          volumeMounts:
+            - name: gateway-data
+              mountPath: /app/data
+          {{- end }}
+
+      {{- if and $.Values.persistence.enabled $svc.persistence }}
+      volumes:
+        - name: gateway-data
+          persistentVolumeClaim:
+            claimName: gateway-data
+      {{- end }}
+---
+{{- end }}

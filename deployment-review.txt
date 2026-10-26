@@ -1,0 +1,2764 @@
+
+========== backend\Dockerfile ==========
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY backend/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+COPY backend /app/backend
+RUN useradd --create-home --uid 10001 appuser
+USER 10001
+EXPOSE 8081
+CMD ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8081"]
+
+========== backend\requirements.txt ==========
+
+mcp>=1.9,<2.0
+python-dotenv>=1.0,<2.0
+cryptography>=44.0,<47.0
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+pydantic>=2.0,<3.0
+
+========== backend\app\main.py ==========
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import HTTPException
+
+import asyncio
+
+from fastapi import Request
+import httpx
+import json
+import inspect
+import logging
+import os
+import re
+import time
+from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+from mcp.server.fastmcp import FastMCP
+from pydantic import BaseModel, Field
+
+from backend.app.upstream_security import (
+    build_auth_headers,
+    validate_upstream_url as validate_secure_upstream_url,
+)
+
+from backend.app.security import (
+    GatewayAuthMiddleware,
+    init_db,
+    create_user,
+    issue_api_key,
+    revoke_api_key,
+    list_users,
+    update_user_role,
+    delete_user,
+    connect_db,
+    current_user_id,
+    current_user_role,
+    current_username,
+    write_audit,
+    load_upstreams,
+    save_upstream,
+    delete_upstream_record,
+)
+
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+load_dotenv(ROOT_DIR / ".env")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("mcp-gateway")
+
+DEFAULT_UPSTREAMS = {
+    "woocommerce": os.getenv(
+        "WOOCOMMERCE_MCP_URL",
+        "http://127.0.0.1:8000/mcp",
+    ),
+    "notes": os.getenv(
+        "NOTES_MCP_URL",
+        "http://127.0.0.1:8002/mcp",
+    ),
+    "inventory": os.getenv(
+        "INVENTORY_MCP_URL",
+        "http://127.0.0.1:8003/mcp",
+    ),
+}
+
+UPSTREAMS: dict[str, str] = {}
+UPSTREAM_ENABLED: dict[str, bool] = {}
+UPSTREAM_CONFIG: dict[str, dict[str, Any]] = {}
+UPSTREAM_FAILURES: dict[str, int] = {}
+
+UPSTREAM_CONNECT_TIMEOUT_SECONDS = int(
+    os.getenv("UPSTREAM_CONNECT_TIMEOUT_SECONDS", "5")
+)
+UPSTREAM_DISCOVERY_TIMEOUT_SECONDS = int(
+    os.getenv("UPSTREAM_DISCOVERY_TIMEOUT_SECONDS", "10")
+)
+UPSTREAM_TOOL_TIMEOUT_SECONDS = int(
+    os.getenv("UPSTREAM_TOOL_TIMEOUT_SECONDS", "20")
+)
+UPSTREAM_HEALTH_CHECK_INTERVAL_SECONDS = max(
+    5, int(os.getenv("UPSTREAM_HEALTH_CHECK_INTERVAL_SECONDS", "30"))
+)
+UPSTREAM_FAILURE_THRESHOLD = max(
+    1, int(os.getenv("UPSTREAM_FAILURE_THRESHOLD", "3"))
+)
+UPSTREAM_CIRCUIT_OPEN_SECONDS = max(
+    1, int(os.getenv("UPSTREAM_CIRCUIT_OPEN_SECONDS", "60"))
+)
+
+TOOL_ROUTES: dict[str, dict[str, str]] = {}
+REGISTRATION_LOCK = asyncio.Lock()
+
+
+# --------------------------------------------------
+# Gateway MCP server
+# --------------------------------------------------
+
+gateway_mcp = FastMCP(
+    "team-mcp-gateway",
+    host="0.0.0.0",
+    port=8081,
+    stateless_http=True,
+)
+
+
+# --------------------------------------------------
+# MCP upstream helpers
+# --------------------------------------------------
+
+def get_upstream_config(server_name: str) -> dict[str, Any]:
+    config = UPSTREAM_CONFIG.get(server_name)
+    if not config:
+        raise RuntimeError(f"Unknown upstream server: {server_name}")
+    if not config.get("enabled", False):
+        raise RuntimeError(f"Upstream '{server_name}' is disabled")
+    return config
+
+
+def get_upstream_headers(config: dict[str, Any]) -> dict[str, str]:
+    return build_auth_headers(
+        auth_mode=config.get("auth_mode", "none"),
+        credential=config.get("credential"),
+        custom_header_name=config.get("custom_header_name"),
+    )
+
+
+def circuit_is_open(config: dict[str, Any]) -> bool:
+    value = config.get("circuit_open_until")
+    if not value:
+        return False
+    try:
+        until = datetime.fromisoformat(value)
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) < until
+    except (TypeError, ValueError):
+        return False
+
+
+def update_upstream_status(
+    name: str,
+    status: str,
+    *,
+    error: str | None = None,
+    discovery_succeeded: bool = False,
+):
+    """Persist safe connection/health metadata without storing secrets."""
+    now = datetime.now(timezone.utc).isoformat()
+    config = UPSTREAM_CONFIG.get(name, {})
+    failures = UPSTREAM_FAILURES.get(
+        name, int(config.get("consecutive_failures") or 0)
+    )
+
+    if status == "connected":
+        failures = 0
+        circuit_open_until = None
+        last_success_at = now
+        last_error = None
+    elif status == "disabled":
+        failures = 0
+        circuit_open_until = None
+        last_success_at = config.get("last_success_at")
+        last_error = None
+    elif status == "circuit_open":
+        circuit_open_until = (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=UPSTREAM_CIRCUIT_OPEN_SECONDS)
+        ).isoformat()
+        last_success_at = config.get("last_success_at")
+        last_error = (error or "Circuit breaker open")[:500]
+    else:
+        failures += 1
+        circuit_open_until = None
+        last_success_at = config.get("last_success_at")
+        last_error = (error or status)[:500]
+        if failures >= UPSTREAM_FAILURE_THRESHOLD:
+            status = "circuit_open"
+            circuit_open_until = (
+                datetime.now(timezone.utc)
+                + timedelta(seconds=UPSTREAM_CIRCUIT_OPEN_SECONDS)
+            ).isoformat()
+
+    UPSTREAM_FAILURES[name] = failures
+    config.update({
+        "connection_status": status,
+        "consecutive_failures": failures,
+        "last_checked_at": now,
+        "last_success_at": last_success_at,
+        "last_error": last_error,
+        "circuit_open_until": circuit_open_until,
+    })
+    if discovery_succeeded:
+        config["last_discovery_at"] = now
+
+    with connect_db() as conn:
+        conn.execute(
+            """
+            UPDATE upstreams
+            SET connection_status = ?,
+                consecutive_failures = ?,
+                last_checked_at = ?,
+                last_success_at = ?,
+                last_discovery_at = ?,
+                last_error = ?,
+                circuit_open_until = ?
+            WHERE name = ?
+            """,
+            (
+                status,
+                failures,
+                now,
+                last_success_at,
+                config.get("last_discovery_at"),
+                last_error,
+                circuit_open_until,
+                name,
+            ),
+        )
+
+
+def record_upstream_success(
+    server_name: str,
+    discovery_succeeded: bool = False,
+):
+    update_upstream_status(
+        server_name,
+        "connected",
+        discovery_succeeded=discovery_succeeded,
+    )
+
+
+def record_upstream_failure(server_name: str, exc: Exception):
+    update_upstream_status(
+        server_name,
+        "error",
+        error=f"{type(exc).__name__}: {str(exc)}",
+    )
+
+
+async def discover_upstream_tools(server_name: str, url: str):
+    """Discover tools from one upstream using its configured auth and timeout."""
+    config = get_upstream_config(server_name)
+    headers = get_upstream_headers(config)
+    timeout_seconds = min(
+        UPSTREAM_DISCOVERY_TIMEOUT_SECONDS,
+        int(config.get("timeout_seconds") or UPSTREAM_DISCOVERY_TIMEOUT_SECONDS),
+    )
+
+    async with streamablehttp_client(
+        url,
+        headers=headers,
+        timeout=timedelta(seconds=UPSTREAM_CONNECT_TIMEOUT_SECONDS),
+        sse_read_timeout=timedelta(seconds=timeout_seconds),
+    ) as (read_stream, write_stream, _):
+        async with ClientSession(read_stream, write_stream) as session:
+            await asyncio.wait_for(
+                session.initialize(),
+                timeout=timeout_seconds,
+            )
+            result = await asyncio.wait_for(
+                session.list_tools(),
+                timeout=timeout_seconds,
+            )
+            return result.tools
+
+
+async def call_upstream(
+    server_name: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+):
+    """Call an upstream MCP tool with authentication, timeout and breaker."""
+    config = get_upstream_config(server_name)
+
+    if circuit_is_open(config):
+        raise RuntimeError(
+            f"Upstream '{server_name}' circuit breaker is open until "
+            f"{config.get('circuit_open_until')}"
+        )
+
+    url = config["url"]
+    headers = get_upstream_headers(config)
+    timeout_seconds = min(
+        UPSTREAM_TOOL_TIMEOUT_SECONDS,
+        int(config.get("timeout_seconds") or UPSTREAM_TOOL_TIMEOUT_SECONDS),
+    )
+
+    try:
+        async with streamablehttp_client(
+            url,
+            headers=headers,
+            timeout=UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+            sse_read_timeout=timeout_seconds,
+        ) as (read_stream, write_stream, _):
+            async with ClientSession(read_stream, write_stream) as session:
+                await asyncio.wait_for(
+                    session.initialize(),
+                    timeout=timeout_seconds,
+                )
+                result = await asyncio.wait_for(
+                    session.call_tool(tool_name, arguments),
+                    timeout=timeout_seconds,
+                )
+
+        if result.isError:
+            record_upstream_failure(
+                server_name,
+                RuntimeError("Upstream tool returned an error"),
+            )
+        else:
+            record_upstream_success(server_name)
+
+        return {
+            "isError": result.isError,
+            "content": [
+                item.model_dump(mode="json")
+                for item in result.content
+            ],
+        }
+    except Exception as exc:
+        record_upstream_failure(server_name, exc)
+        raise
+
+
+# --------------------------------------------------
+# Dynamic tool registration
+# --------------------------------------------------
+
+def safe_tool_name(name: str) -> str:
+    """Convert a name into a predictable identifier."""
+    normalized = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+    return normalized.strip("_") or "unnamed_tool"
+
+
+def make_proxy(
+    server_name: str,
+    upstream_tool_name: str,
+    input_schema: dict,
+):
+    """Create a dynamically typed proxy for an upstream tool."""
+    properties = input_schema.get("properties", {})
+    required_fields = set(input_schema.get("required", []))
+
+    parameters = []
+
+    for name, details in properties.items():
+        schema_type = details.get("type", "string")
+
+        type_mapping = {
+            "string": str,
+            "integer": int,
+            "number": float,
+            "boolean": bool,
+            "object": dict,
+            "array": list,
+        }
+
+        annotation = type_mapping.get(schema_type, Any)
+
+        if name in required_fields:
+            default = inspect.Parameter.empty
+        else:
+            if "default" in details:
+                default = details["default"]
+            elif schema_type == "integer":
+                default = 10 if name == "per_page" else None
+            else:
+                default = None
+
+            if default is None:
+                annotation = Any
+
+        parameters.append(
+            inspect.Parameter(
+                name=name,
+                kind=inspect.Parameter.KEYWORD_ONLY,
+                default=default,
+                annotation=annotation,
+            )
+        )
+
+    async def proxy(**arguments):
+        arguments = {
+            key: value
+            for key, value in arguments.items()
+            if value is not None
+        }
+
+        audit_started_at = datetime.now(timezone.utc).isoformat()
+        started = time.perf_counter()
+        outcome = "success"
+        error_message = None
+
+        user_id = current_user_id.get()
+        username = current_username.get()
+
+        try:
+            user_role = current_user_role.get()
+
+            write_tools = {
+                ("notes", "create_note"),
+                
+                ("woocommerce", "update_order_status"),
+            }
+
+            if (
+                (server_name, upstream_tool_name) in write_tools
+                and user_role != "admin"
+            ):
+                raise PermissionError(
+                    "Admin role required to execute this write tool"
+                )
+
+            result = await call_upstream(
+                server_name,
+                upstream_tool_name,
+                arguments,
+            )
+
+            if result.get("isError"):
+                outcome = "error"
+                error_message = "Upstream tool returned an error"
+
+            return result
+
+        except Exception as exc:
+            outcome = (
+                "timeout"
+                if isinstance(exc, (asyncio.TimeoutError, TimeoutError))
+                else "error"
+            )
+            error_message = str(exc)[:500] or type(exc).__name__
+            raise
+
+        finally:
+            duration_ms = int(
+                (time.perf_counter() - started) * 1000
+            )
+
+            try:
+                write_audit(
+                    user_id=user_id,
+                    username=username,
+                    server_name=server_name,
+                    tool_name=upstream_tool_name,
+                    duration_ms=duration_ms,
+                    outcome=outcome,
+                    error_message=error_message,
+                    started_at=audit_started_at,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to write MCP tool audit record"
+                )
+
+    proxy.__name__ = f"{server_name}_{upstream_tool_name}"
+    proxy.__doc__ = f"Proxy for {server_name}.{upstream_tool_name}"
+    proxy.__signature__ = inspect.Signature(parameters)
+
+    return proxy
+
+
+async def refresh_upstream_tools() -> dict[str, int]:
+    """
+    Discover enabled upstreams concurrently.
+
+    Temporary failures do not remove previously registered tools. Disabled
+    and deleted upstreams have their tools removed from the gateway.
+    """
+    candidates = [
+        (name, config["url"])
+        for name, config in list(UPSTREAM_CONFIG.items())
+        if config.get("enabled", False)
+    ]
+
+    async def discover_one(name: str, url: str):
+        config = UPSTREAM_CONFIG.get(name, {})
+        if circuit_is_open(config):
+            # Do not count a skipped probe as another failure.
+            return name, [], None, False
+
+        try:
+            tools = await discover_upstream_tools(name, url)
+            record_upstream_success(name, discovery_succeeded=True)
+            return name, tools, None, True
+        except Exception as exc:
+            record_upstream_failure(name, exc)
+            logger.warning(
+                "Discovery failed for upstream '%s': %s",
+                name,
+                str(exc)[:300],
+            )
+            return name, [], exc, False
+
+    results = await asyncio.gather(
+        *(discover_one(name, url) for name, url in candidates),
+        return_exceptions=False,
+    )
+
+    discovered: dict[str, list[Any]] = {}
+    successful_names: set[str] = set()
+
+    for name, tools, error, succeeded in results:
+        if succeeded:
+            discovered[name] = tools
+            successful_names.add(name)
+
+    registered_count = 0
+
+    async with REGISTRATION_LOCK:
+        for server_name, tools in discovered.items():
+            new_routes: dict[str, dict[str, str]] = {}
+
+            for upstream_tool in tools:
+                gateway_name = (
+                    f"{safe_tool_name(server_name)}__"
+                    f"{safe_tool_name(upstream_tool.name)}"
+                )
+                route = {
+                    "server": server_name,
+                    "tool": upstream_tool.name,
+                }
+                existing = TOOL_ROUTES.get(gateway_name)
+
+                if existing and existing != route:
+                    logger.error(
+                        "Tool name collision for '%s'",
+                        gateway_name,
+                    )
+                    continue
+
+                if existing == route:
+                    new_routes[gateway_name] = route
+                    registered_count += 1
+                    continue
+
+                try:
+                    proxy = make_proxy(
+                        server_name,
+                        upstream_tool.name,
+                        upstream_tool.inputSchema,
+                    )
+                    gateway_mcp.add_tool(
+                        proxy,
+                        name=gateway_name,
+                        description=(
+                            upstream_tool.description
+                            or f"Proxy for {upstream_tool.name}"
+                        ),
+                    )
+                    new_routes[gateway_name] = route
+                    registered_count += 1
+                except Exception:
+                    logger.exception(
+                        "Could not register tool '%s'",
+                        gateway_name,
+                    )
+
+            # Remove stale tools only after successful discovery.
+            old_names = [
+                name
+                for name, route in TOOL_ROUTES.items()
+                if route["server"] == server_name
+                and name not in new_routes
+            ]
+            for old_name in old_names:
+                gateway_mcp.remove_tool(old_name)
+                TOOL_ROUTES.pop(old_name, None)
+
+            TOOL_ROUTES.update(new_routes)
+
+        # Remove tools belonging to disabled or deleted upstreams.
+        inactive_names = [
+            name
+            for name, route in TOOL_ROUTES.items()
+            if route["server"] not in UPSTREAM_CONFIG
+            or not UPSTREAM_ENABLED.get(route["server"], False)
+        ]
+        for name in inactive_names:
+            gateway_mcp.remove_tool(name)
+            TOOL_ROUTES.pop(name, None)
+
+    return {
+        "upstreams_discovered": len(successful_names),
+        "tools_registered": registered_count,
+    }
+
+
+async def upstream_monitor_loop():
+    """Periodically refresh upstream health and tool catalogues."""
+    while True:
+        await asyncio.sleep(UPSTREAM_HEALTH_CHECK_INTERVAL_SECONDS)
+        try:
+            await refresh_upstream_tools()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Background upstream refresh failed")
+
+
+# --------------------------------------------------
+# Upstream models and validation
+# --------------------------------------------------
+
+class UpstreamCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=50)
+    url: str = Field(min_length=1, max_length=500)
+    enabled: bool = True
+    auth_mode: str = Field(
+        default="none",
+        pattern="^(none|bearer|custom_header)$",
+    )
+    credential: str | None = Field(default=None, max_length=4096)
+    custom_header_name: str | None = Field(default=None, max_length=100)
+    timeout_seconds: int = Field(default=20, ge=1, le=120)
+
+
+class UpstreamUpdate(BaseModel):
+    url: str | None = Field(default=None, max_length=500)
+    enabled: bool | None = None
+    auth_mode: str | None = Field(
+        default=None,
+        pattern="^(none|bearer|custom_header)$",
+    )
+    credential: str | None = Field(default=None, max_length=4096)
+    custom_header_name: str | None = Field(default=None, max_length=100)
+    timeout_seconds: int | None = Field(default=None, ge=1, le=120)
+
+
+def validate_upstream_url(url: str) -> str:
+    try:
+        return validate_secure_upstream_url(url)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+# --------------------------------------------------
+# Persistent upstream configuration
+# --------------------------------------------------
+
+def load_saved_upstreams():
+    """Load persisted upstreams and decrypt credentials for runtime use."""
+    saved = load_upstreams()
+
+    if not saved:
+        for name, url in DEFAULT_UPSTREAMS.items():
+            save_upstream(
+                name=name,
+                url=url,
+                enabled=True,
+                auth_mode="none",
+            )
+
+    saved = load_upstreams(include_secrets=True)
+
+    UPSTREAMS.clear()
+    UPSTREAM_ENABLED.clear()
+    UPSTREAM_CONFIG.clear()
+    UPSTREAM_FAILURES.clear()
+
+    for upstream in saved:
+        name = upstream["name"]
+        UPSTREAMS[name] = upstream["url"]
+        UPSTREAM_ENABLED[name] = upstream["enabled"]
+        UPSTREAM_CONFIG[name] = dict(upstream)
+        UPSTREAM_FAILURES[name] = upstream.get(
+            "consecutive_failures", 0
+        )
+
+    logger.info("Loaded %d upstream configurations", len(saved))
+
+
+# --------------------------------------------------
+# Application lifecycle
+# --------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    load_saved_upstreams()
+
+    # Gateway startup must not fail merely because an upstream is down.
+    try:
+        await refresh_upstream_tools()
+    except Exception:
+        logger.exception("Initial upstream discovery failed")
+
+    monitor_task = asyncio.create_task(
+        upstream_monitor_loop(),
+        name="upstream-monitor",
+    )
+    try:
+        async with gateway_mcp.session_manager.run():
+            yield
+    finally:
+        monitor_task.cancel()
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            pass
+
+
+# --------------------------------------------------
+# FastAPI application
+# --------------------------------------------------
+
+app = FastAPI(
+    title="MCP Gateway",
+    description="Dynamic gateway for multiple MCP servers",
+    version="0.8.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(GatewayAuthMiddleware)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --------------------------------------------------
+# User and API-key administration models
+# --------------------------------------------------
+
+class UserCreate(BaseModel):
+    username: str = Field(min_length=2, max_length=80)
+    email: str | None = Field(default=None, max_length=254)
+    role: str = Field(
+        default="member",
+        pattern="^(admin|member)$",
+    )
+
+
+class KeyCreate(BaseModel):
+    label: str = Field(
+        default="default",
+        min_length=1,
+        max_length=80,
+    )
+
+class UserRoleUpdate(BaseModel):
+    role: str = Field(pattern="^(admin|member)$")
+
+
+# --------------------------------------------------
+# Admin user and API-key endpoints
+# --------------------------------------------------
+
+@app.post("/admin/users", status_code=201)
+async def admin_create_user(payload: UserCreate):
+    try:
+        user_id = create_user(
+            payload.username,
+            payload.role,
+            payload.email,
+        )
+    except Exception as exc:
+        if "UNIQUE constraint failed" in str(exc):
+            raise HTTPException(
+                status_code=409,
+                detail="Username or email already exists",
+            ) from exc
+
+        if isinstance(exc, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail=str(exc),
+            ) from exc
+
+        raise
+
+    return {
+        "user_id": user_id,
+        "username": payload.username,
+        "role": payload.role,
+    }
+
+
+@app.get("/admin/users")
+async def admin_list_users():
+    return {"users": list_users()}
+
+
+@app.patch("/admin/users/{user_id}")
+async def admin_update_user(user_id: str, payload: UserRoleUpdate):
+    if user_id == current_user_id.get() and payload.role != "admin":
+        raise HTTPException(
+            status_code=400, detail="You cannot demote yourself"
+        )
+
+    try:
+        updated = update_user_role(user_id, payload.role)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {"user_id": user_id, "role": payload.role}
+
+
+@app.delete("/admin/users/{user_id}")
+async def admin_delete_user(user_id: str):
+    if user_id == current_user_id.get():
+        raise HTTPException(
+            status_code=400, detail="You cannot remove your own account"
+        )
+
+    try:
+        deleted = delete_user(user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {"message": "User removed", "user_id": user_id}
+
+
+@app.post("/admin/users/{user_id}/keys", status_code=201)
+async def admin_issue_key(user_id: str, payload: KeyCreate):
+    try:
+        return issue_api_key(user_id, payload.label)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc),
+        ) from exc
+
+
+@app.get("/admin/keys")
+async def admin_list_keys():
+    with connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                k.id AS key_id,
+                k.user_id,
+                u.username,
+                k.label,
+                k.key_prefix,
+                k.last_used_at,
+                k.created_at,
+                k.revoked_at,
+                k.revoked
+            FROM api_keys AS k
+            JOIN users AS u ON u.id = k.user_id
+            ORDER BY k.id DESC
+            LIMIT 500
+            """
+        ).fetchall()
+
+    return {"keys": [dict(row) for row in rows]}
+
+
+@app.post("/admin/keys/{key_id}/revoke")
+async def admin_revoke_key(key_id: int):
+    if not revoke_api_key(key_id):
+        raise HTTPException(
+            status_code=404,
+            detail="Active API key not found",
+        )
+
+    return {
+        "message": "API key revoked",
+        "key_id": key_id,
+    }
+
+
+# --------------------------------------------------
+# Member self-service API-key endpoints
+# --------------------------------------------------
+
+@app.get("/api/tools")
+async def list_my_tools():
+    """List tools from enabled upstreams for any authenticated API user."""
+    registered = await gateway_mcp.list_tools()
+
+    tools = []
+    for tool in registered:
+        route = TOOL_ROUTES.get(tool.name)
+        if route is None:
+            continue
+
+        server_name = route["server"]
+        config = UPSTREAM_CONFIG.get(server_name)
+
+        # Do not expose tools from disabled, deleted, or unknown upstreams.
+        if not config or not config.get("enabled", False):
+            continue
+
+        tools.append({
+            "gateway_name": tool.name,
+            "upstream_server": server_name,
+            "upstream_tool": route["tool"],
+            "description": tool.description,
+            "input_schema": tool.inputSchema,
+        })
+
+    tools.sort(key=lambda item: (
+        item["upstream_server"],
+        item["upstream_tool"],
+    ))
+    return {"tools": tools}
+
+
+@app.get("/api/me")
+async def get_current_member():
+    """Return the identity associated with the supplied API key."""
+    return {
+        "user_id": current_user_id.get(),
+        "username": current_username.get(),
+        "role": current_user_role.get(),
+    }
+
+
+@app.get("/api/me/keys")
+async def list_my_api_keys():
+    """List only API keys belonging to the authenticated user."""
+    user_id = current_user_id.get()
+
+    with connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                id AS key_id,
+                label,
+                key_prefix,
+                last_used_at,
+                created_at,
+                revoked_at,
+                revoked
+            FROM api_keys
+            WHERE user_id = ?
+            ORDER BY id DESC
+            """,
+            (user_id,),
+        ).fetchall()
+
+    return {"keys": [dict(row) for row in rows]}
+
+
+@app.post("/api/me/keys", status_code=201)
+async def create_my_api_key(payload: KeyCreate):
+    """Create an API key for the authenticated user."""
+    user_id = current_user_id.get()
+
+    try:
+        return issue_api_key(user_id, payload.label)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+
+@app.post("/api/me/keys/{key_id}/revoke")
+async def revoke_my_api_key(key_id: int):
+    """Revoke a key only if it belongs to the authenticated user."""
+    user_id = current_user_id.get()
+
+    with connect_db() as conn:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM api_keys
+            WHERE id = ? AND user_id = ? AND revoked = 0
+            """,
+            (key_id, user_id),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Active API key not found",
+        )
+
+    if not revoke_api_key(key_id):
+        raise HTTPException(
+            status_code=409,
+            detail="API key could not be revoked",
+        )
+
+    return {
+        "message": "API key revoked",
+        "key_id": key_id,
+    }
+
+
+# --------------------------------------------------
+# Audit endpoints
+# --------------------------------------------------
+
+@app.get("/admin/audit")
+async def admin_audit(
+    limit: int = 100,
+    offset: int = 0,
+    user_id: str | None = None,
+    username: str | None = None,
+    server_name: str | None = None,
+    tool_name: str | None = None,
+    outcome: str | None = None,
+):
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+
+    filters = []
+    values = []
+
+    for column, value in (
+        ("user_id", user_id),
+        ("username", username),
+        ("server_name", server_name),
+        ("tool_name", tool_name),
+        ("outcome", outcome),
+    ):
+        if value is not None and value.strip():
+            filters.append(f"{column} = ?")
+            values.append(value.strip())
+
+    where_clause = (
+        " WHERE " + " AND ".join(filters)
+        if filters else ""
+    )
+
+    with connect_db() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM audit_logs{where_clause}",
+            values,
+        ).fetchone()[0]
+
+        rows = conn.execute(
+            f"""
+            SELECT
+                id,
+                user_id,
+                username,
+                server_name,
+                tool_name,
+                started_at,
+                timestamp,
+                duration_ms,
+                outcome,
+                error_message
+            FROM audit_logs
+            {where_clause}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*values, limit, offset],
+        ).fetchall()
+
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "audit": [dict(row) for row in rows],
+    }
+
+
+# --------------------------------------------------
+# Health and tool endpoints
+# --------------------------------------------------
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "service": "mcp-gateway",
+        "registered_tools": len(TOOL_ROUTES),
+    }
+
+
+@app.get("/readyz")
+async def readyz():
+    try:
+        with connect_db() as conn:
+            conn.execute("SELECT 1").fetchone()
+
+        return {"status": "ready"}
+
+    except Exception:
+        logger.exception("Readiness check failed")
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable",
+        )
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
+
+
+@app.post("/admin/refresh-tools")
+async def refresh_tools_endpoint():
+    return await refresh_upstream_tools()
+
+
+@app.get("/admin/tools")
+async def list_registered_tools():
+    return {
+        "tools": [
+            {
+                "gateway_name": name,
+                "upstream_server": route["server"],
+                "upstream_tool": route["tool"],
+            }
+            for name, route in sorted(TOOL_ROUTES.items())
+        ]
+    }
+
+
+# --------------------------------------------------
+# Upstream management endpoints
+# --------------------------------------------------
+
+@app.get("/admin/upstreams")
+async def list_upstreams():
+    # load_upstreams() intentionally omits credentials and ciphertext.
+    return {"upstreams": load_upstreams()}
+
+
+@app.post("/admin/upstreams", status_code=201)
+async def add_upstream(payload: UpstreamCreate):
+    name = safe_tool_name(payload.name)
+
+    if len(name) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Upstream name must contain at least two valid characters",
+        )
+
+    if name in UPSTREAM_CONFIG:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Upstream '{name}' already exists",
+        )
+
+    url = validate_upstream_url(payload.url)
+
+    try:
+        save_upstream(
+            name=name,
+            url=url,
+            enabled=payload.enabled,
+            auth_mode=payload.auth_mode,
+            credential=payload.credential,
+            custom_header_name=payload.custom_header_name,
+            timeout_seconds=payload.timeout_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    load_saved_upstreams()
+    result = await refresh_upstream_tools()
+    saved = next(
+        item for item in load_upstreams() if item["name"] == name
+    )
+
+    return {
+        "message": "Upstream added",
+        **saved,
+        **result,
+    }
+
+
+@app.patch("/admin/upstreams/{name}")
+async def update_upstream(name: str, payload: UpstreamUpdate):
+    current = UPSTREAM_CONFIG.get(name)
+    if current is None:
+        raise HTTPException(status_code=404, detail="Upstream not found")
+
+    new_url = (
+        validate_upstream_url(payload.url)
+        if payload.url is not None
+        else current["url"]
+    )
+    new_enabled = (
+        payload.enabled
+        if payload.enabled is not None
+        else current["enabled"]
+    )
+    new_auth_mode = (
+        payload.auth_mode
+        if payload.auth_mode is not None
+        else current.get("auth_mode", "none")
+    )
+    new_header_name = (
+        payload.custom_header_name
+        if payload.custom_header_name is not None
+        else current.get("custom_header_name")
+    )
+    new_timeout = (
+        payload.timeout_seconds
+        if payload.timeout_seconds is not None
+        else current.get("timeout_seconds", 20)
+    )
+
+    try:
+        save_upstream(
+            name=name,
+            url=new_url,
+            enabled=new_enabled,
+            auth_mode=new_auth_mode,
+            credential=payload.credential,
+            custom_header_name=new_header_name,
+            timeout_seconds=new_timeout,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    load_saved_upstreams()
+
+    if not new_enabled:
+        update_upstream_status(name, "disabled")
+
+    result = await refresh_upstream_tools()
+    updated = next(
+        item for item in load_upstreams() if item["name"] == name
+    )
+
+    return {
+        "message": "Upstream updated",
+        **updated,
+        **result,
+    }
+
+
+@app.delete("/admin/upstreams/{name}")
+async def delete_upstream(name: str):
+    if name not in UPSTREAM_CONFIG:
+        raise HTTPException(status_code=404, detail="Upstream not found")
+
+    UPSTREAMS.pop(name, None)
+    UPSTREAM_ENABLED.pop(name, None)
+    UPSTREAM_CONFIG.pop(name, None)
+    UPSTREAM_FAILURES.pop(name, None)
+    delete_upstream_record(name)
+
+    async with REGISTRATION_LOCK:
+        old_names = [
+            tool_name
+            for tool_name, route in TOOL_ROUTES.items()
+            if route["server"] == name
+        ]
+        for tool_name in old_names:
+            gateway_mcp.remove_tool(tool_name)
+            TOOL_ROUTES.pop(tool_name, None)
+
+    return {
+        "message": "Upstream removed",
+        "name": name,
+        "removed_tools": len(old_names),
+    }
+
+
+@app.get("/admin/upstream-status")
+async def upstream_status():
+    return {
+        "upstreams": [
+            {
+                "name": item["name"],
+                "enabled": item["enabled"],
+                "status": item["connection_status"],
+                "consecutive_failures": item["consecutive_failures"],
+                "last_checked_at": item["last_checked_at"],
+                "last_success_at": item["last_success_at"],
+                "last_discovery_at": item["last_discovery_at"],
+                "last_error": item["last_error"],
+                "circuit_open_until": item["circuit_open_until"],
+            }
+            for item in load_upstreams()
+        ]
+    }
+
+
+
+class ChatRequest(BaseModel):
+    message: str
+    history: list[dict[str, str]] | None = None
+
+
+@app.post("/api/chat")
+async def chat_with_agent(payload: ChatRequest, request: Request):
+    """Chat with an LLM that can invoke tools through this MCP gateway."""
+    import json
+    import os
+    import httpx
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    
+    api_key = request.headers.get("x-api-key")
+
+    llm_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+    base_url = os.getenv("LLM_BASE_URL")
+    model = os.getenv("LLM_MODEL")
+    gateway_url = os.getenv(
+        "GATEWAY_MCP_URL",
+        "http://127.0.0.1:8081/mcp/mcp",
+    )
+
+    if not api_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing gateway API key.",
+        )
+
+    if not llm_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Chat model is not configured. Set LLM_API_KEY.",
+        )
+
+    if not base_url:
+        raise HTTPException(
+            status_code=503,
+            detail="LLM_BASE_URL is not configured.",
+        )
+
+    if not model:
+        raise HTTPException(
+            status_code=503,
+            detail="LLM_MODEL is not configured.",
+        )
+
+    if not payload.message.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="Message cannot be empty.",
+        )
+
+    base_url = base_url.rstrip("/")
+
+    messages = [{
+        "role": "system",
+        "content": (
+            "You are a helpful team assistant. Use the available MCP tools "
+            "when needed to answer questions or perform requested actions. "
+            "Never claim an action succeeded unless a tool result confirms it. "
+            "Ask for clarification when required arguments are missing."
+        )
+    }]
+
+    # Accept only ordinary conversation history, not client-supplied tool results.
+    for item in (payload.history or [])[-12:]:
+        role = item.get("role")
+        content = item.get("content")
+        if role in ("user", "assistant") and isinstance(content, str):
+            messages.append({"role": role, "content": content})
+
+    messages.append({"role": "user", "content": payload.message})
+    executed_calls = []
+
+    mcp_http_client = httpx.AsyncClient(
+        headers={"x-api-key": api_key},
+        timeout=60.0,
+    )
+    try:
+        async with streamable_http_client(
+            gateway_url,
+            http_client=mcp_http_client,
+        ) as (read_stream, write_stream, _):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                listed = await session.list_tools()
+
+                llm_tools = []
+                for tool in listed.tools:
+                    llm_tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description or tool.name,
+                            "parameters": tool.inputSchema or {
+                                "type": "object", "properties": {}
+                            },
+                        },
+                    })
+
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    for _ in range(6):
+                        body = {
+                            "model": model,
+                            "messages": messages,
+                        }
+                        if llm_tools:
+                            body["tools"] = llm_tools
+                            body["tool_choice"] = "auto"
+
+                        response = await client.post(
+                            f"{base_url}/chat/completions",
+                            headers={"Authorization": f"Bearer {llm_key}"},
+                            json=body,
+                        )
+                        response.raise_for_status()
+                        choice = response.json()["choices"][0]
+                        assistant_message = choice["message"]
+                        calls = assistant_message.get("tool_calls") or []
+
+                        if not calls:
+                            return {
+                                "answer": assistant_message.get("content") or "",
+                                "tool_calls": executed_calls,
+                                "model": model,
+                            }
+
+                        messages.append(assistant_message)
+
+                        for call in calls:
+                            function = call["function"]
+                            tool_name = function["name"]
+
+                            try:
+                                arguments = json.loads(
+                                    function.get("arguments") or "{}"
+                                )
+                                result = await session.call_tool(
+                                    tool_name, arguments=arguments
+                                )
+
+                                content = []
+                                for item in (result.content or []):
+                                    text_value = getattr(item, "text", None)
+                                    if text_value is not None:
+                                        content.append(text_value)
+                                    elif hasattr(item, "model_dump"):
+                                        content.append(
+                                            item.model_dump(mode="json")
+                                        )
+                                    else:
+                                        content.append(str(item))
+
+                                tool_output = json.dumps({
+                                    "isError": bool(result.isError),
+                                    "content": content,
+                                }, ensure_ascii=False)
+
+                                executed_calls.append({
+                                    "tool": tool_name,
+                                    "arguments": arguments,
+                                    "result": tool_output[:4000],
+                                    "isError": bool(result.isError),
+                                })
+                            except Exception as exc:
+                                tool_output = json.dumps({
+                                    "error": str(exc)[:1000]
+                                })
+                                executed_calls.append({
+                                    "tool": tool_name,
+                                    "error": str(exc)[:1000],
+                                })
+
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": call["id"],
+                                "content": tool_output,
+                            })
+
+                return {
+                    "answer": "The tool-call limit was reached. Please refine your request.",
+                    "tool_calls": executed_calls,
+                    "model": model,
+                }
+
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Chat provider returned HTTP {exc.response.status_code}."
+        ) from exc
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="The chat provider timed out."
+        ) from exc
+    except Exception as exc:
+        logger.exception("Chat agent failed with an unexpected exception")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Chat agent failed: {type(exc).__name__}. Check gateway logs."
+        ) from exc
+    finally:
+        await mcp_http_client.aclose()
+
+
+
+# MCP endpoint: http://127.0.0.1:8081/mcp/mcp
+app.mount(
+    "/mcp",
+    gateway_mcp.streamable_http_app(),
+)
+
+========== servers\woocommerce-mcp\Dockerfile ==========
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY servers/woocommerce-mcp/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt "uvicorn[standard]>=0.30,<1.0"
+COPY servers/woocommerce-mcp/app/main.py /app/main.py
+RUN useradd --create-home --uid 10001 appuser
+USER 10001
+EXPOSE 8000
+CMD ["python", "main.py"]
+
+========== servers\woocommerce-mcp\requirements.txt ==========
+
+mcp>=1.9,<2.0
+httpx>=0.27,<1.0
+python-dotenv>=1.0,<2.0
+
+========== servers\woocommerce-mcp\app\main.py ==========
+import asyncio
+import base64
+import hashlib
+import hmac
+import os
+import secrets
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from urllib.parse import quote, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import httpx
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from mcp.server.fastmcp import FastMCP
+
+
+# ---------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------
+
+PROJECT_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..")
+)
+load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
+
+STORE_URL = os.getenv("WOOCOMMERCE_URL", "").rstrip("/")
+CONSUMER_KEY = os.getenv("WOOCOMMERCE_CONSUMER_KEY", "")
+CONSUMER_SECRET = os.getenv("WOOCOMMERCE_CONSUMER_SECRET", "")
+REQUEST_TIMEOUT = float(os.getenv("WOOCOMMERCE_TIMEOUT", "20"))
+STORE_TIMEZONE = os.getenv("STORE_TIMEZONE", "UTC")
+
+ALLOWED_ORDER_STATUSES = {
+    "pending",
+    "processing",
+    "on-hold",
+    "completed",
+    "cancelled",
+    "refunded",
+    "failed",
+}
+
+
+# ---------------------------------------------------------
+# MCP server
+# ---------------------------------------------------------
+
+mcp = FastMCP(
+    "woocommerce-mcp",
+    host="0.0.0.0",
+    port=8000,
+    stateless_http=True,
+)
+
+
+# ---------------------------------------------------------
+# Configuration and validation helpers
+# ---------------------------------------------------------
+
+def validate_configuration() -> None:
+    """Validate required configuration without exposing credentials."""
+    if not STORE_URL:
+        raise RuntimeError("WOOCOMMERCE_URL is not configured.")
+
+    parsed = urlsplit(STORE_URL)
+
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError(
+            "WOOCOMMERCE_URL must be a valid HTTP(S) URL."
+        )
+
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise RuntimeError(
+            "WOOCOMMERCE_URL must not contain credentials, "
+            "query parameters, or fragments."
+        )
+
+    if not CONSUMER_KEY or not CONSUMER_SECRET:
+        raise RuntimeError(
+            "WooCommerce API credentials are not configured."
+        )
+
+    if REQUEST_TIMEOUT <= 0:
+        raise RuntimeError("WOOCOMMERCE_TIMEOUT must be greater than zero.")
+
+    try:
+        ZoneInfo(STORE_TIMEZONE)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise RuntimeError(
+            "STORE_TIMEZONE must be a valid IANA timezone, "
+            "such as Asia/Kolkata."
+        ) from exc
+
+
+def api_base_url() -> str:
+    """Build the WooCommerce REST API base URL."""
+    validate_configuration()
+    return f"{STORE_URL}/wp-json/wc/v3"
+
+
+def _pct(value: str) -> str:
+    """OAuth percent encoding."""
+    return quote(str(value), safe="~-._")
+
+
+def _positive_price(value: str) -> str:
+    """Validate and normalize a non-negative product price."""
+    try:
+        price = Decimal(value)
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError(
+            "regular_price must be a valid decimal number."
+        ) from None
+
+    if not price.is_finite() or price < 0:
+        raise ValueError(
+            "regular_price must be a finite, non-negative number."
+        )
+
+    return format(price, "f")
+
+
+def _parse_datetime(value: str, field_name: str) -> datetime:
+    """Parse an ISO-8601 datetime that includes a timezone."""
+    try:
+        parsed = datetime.fromisoformat(
+            value.strip().replace("Z", "+00:00")
+        )
+    except ValueError:
+        raise ValueError(
+            f"{field_name} must be a valid ISO-8601 datetime."
+        ) from None
+
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(
+            f"{field_name} must include a timezone offset."
+        )
+
+    return parsed
+
+
+# ---------------------------------------------------------
+# WooCommerce REST API / OAuth 1.0a
+# ---------------------------------------------------------
+
+def _oauth_params(method: str, url: str, params: dict) -> dict:
+    """Sign a WooCommerce REST request using HMAC-SHA256."""
+    if not CONSUMER_KEY or not CONSUMER_SECRET:
+        raise RuntimeError(
+            "WooCommerce API credentials are not configured."
+        )
+
+    oauth = {
+        "oauth_consumer_key": CONSUMER_KEY,
+        "oauth_nonce": secrets.token_hex(16),
+        "oauth_signature_method": "HMAC-SHA256",
+        "oauth_timestamp": str(int(time.time())),
+        "oauth_version": "1.0",
+    }
+
+    all_params = [
+        (str(key), str(value))
+        for key, value in {**params, **oauth}.items()
+        if value is not None
+    ]
+
+    encoded_params = sorted(
+        (_pct(key), _pct(value))
+        for key, value in all_params
+    )
+    normalized = "&".join(
+        f"{key}={value}" for key, value in encoded_params
+    )
+
+    parsed = urlsplit(url)
+    base_url = urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, "", "")
+    )
+
+    base_string = "&".join(
+        [
+            method.upper(),
+            _pct(base_url),
+            _pct(normalized),
+        ]
+    )
+
+    signing_key = f"{_pct(CONSUMER_SECRET)}&"
+    digest = hmac.new(
+        signing_key.encode(),
+        base_string.encode(),
+        hashlib.sha256,
+    ).digest()
+
+    oauth["oauth_signature"] = base64.b64encode(digest).decode()
+    return oauth
+
+
+async def wc_request(
+    method: str,
+    endpoint: str,
+    *,
+    params: dict | None = None,
+    payload: dict | None = None,
+):
+    """Call WooCommerce and return parsed JSON."""
+    url = f"{api_base_url()}/{endpoint.lstrip('/')}"
+    query = {
+        key: value
+        for key, value in (params or {}).items()
+        if value is not None
+    }
+    query.update(_oauth_params(method, url, query))
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT
+        ) as client:
+            response = await client.request(
+                method,
+                url,
+                params=query,
+                json=payload,
+            )
+    except httpx.TimeoutException:
+        raise RuntimeError(
+            f"WooCommerce API request timed out after "
+            f"{REQUEST_TIMEOUT:g} seconds."
+        ) from None
+    except httpx.RequestError as exc:
+        # Do not include the request URL, query parameters, or credentials.
+        raise RuntimeError(
+            f"Could not connect to WooCommerce "
+            f"({type(exc).__name__})."
+        ) from None
+
+    if not response.is_success:
+        message = (
+            f"WooCommerce API returned HTTP {response.status_code}."
+        )
+
+        try:
+            body = response.json()
+            if isinstance(body, dict):
+                api_message = body.get("message")
+                api_code = body.get("code")
+
+                if isinstance(api_code, str):
+                    message += f" Error code: {api_code}."
+                if isinstance(api_message, str):
+                    message += f" {api_message[:300]}"
+        except ValueError:
+            message += " The response was not valid JSON."
+
+        raise RuntimeError(message)
+
+    try:
+        return response.json()
+    except ValueError:
+        raise RuntimeError(
+            "WooCommerce API returned invalid JSON."
+        ) from None
+
+
+# ---------------------------------------------------------
+# Product formatting
+# ---------------------------------------------------------
+
+def _format_product(product: dict) -> dict:
+    return {
+        "id": product.get("id"),
+        "name": product.get("name"),
+        "sku": product.get("sku"),
+        "price": product.get("price"),
+        "regular_price": product.get("regular_price"),
+        "status": product.get("status"),
+        "stock_status": product.get("stock_status"),
+        "permalink": product.get("permalink"),
+    }
+
+
+# ---------------------------------------------------------
+# MCP tool 1: list_products
+# ---------------------------------------------------------
+
+@mcp.tool()
+async def list_products(
+    search: str = "",
+    per_page: int = 20,
+) -> list[dict]:
+    """List products, optionally filtered by search text."""
+    if not isinstance(search, str) or len(search) > 200:
+        raise ValueError("search must be a string of at most 200 characters.")
+
+    if not 1 <= per_page <= 100:
+        raise ValueError("per_page must be between 1 and 100.")
+
+    result = await wc_request(
+        "GET",
+        "products",
+        params={
+            "search": search.strip() or None,
+            "per_page": per_page,
+        },
+    )
+
+    if not isinstance(result, list):
+        raise RuntimeError("Unexpected response while listing products.")
+
+    return [_format_product(item) for item in result]
+
+
+# ---------------------------------------------------------
+# MCP tool 2: create_product
+# ---------------------------------------------------------
+
+@mcp.tool()
+async def create_product(
+    name: str,
+    regular_price: str,
+    description: str = "",
+) -> dict:
+    """Create a published WooCommerce product."""
+    if not isinstance(name, str):
+        raise ValueError("Product name must be a string.")
+
+    name = name.strip()
+
+    if not name or len(name) > 200:
+        raise ValueError("Product name must contain 1–200 characters.")
+
+    if not isinstance(description, str) or len(description) > 10000:
+        raise ValueError(
+            "description must be a string of at most 10000 characters."
+        )
+
+    price = _positive_price(regular_price)
+
+    result = await wc_request(
+        "POST",
+        "products",
+        payload={
+            "name": name,
+            "regular_price": price,
+            "description": description,
+            "status": "publish",
+        },
+    )
+
+    return _format_product(result)
+
+
+# ---------------------------------------------------------
+# MCP tool 3: list_orders
+# ---------------------------------------------------------
+
+@mcp.tool()
+async def list_orders(
+    after: str = "",
+    before: str = "",
+    per_page: int = 20,
+    today: bool = False,
+) -> list[dict]:
+    """
+    List orders by date.
+
+    Set today=True to filter from midnight to midnight in STORE_TIMEZONE.
+    Otherwise, optionally provide timezone-aware ISO-8601 after/before values.
+    """
+    if not 1 <= per_page <= 100:
+        raise ValueError("per_page must be between 1 and 100.")
+
+    after = after.strip()
+    before = before.strip()
+
+    if today and (after or before):
+        raise ValueError(
+            "Use today=True or provide after/before, not both."
+        )
+
+    query = {
+        "per_page": per_page,
+        "orderby": "date",
+        "order": "desc",
+    }
+
+    if today:
+        try:
+            store_tz = ZoneInfo(STORE_TIMEZONE)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise RuntimeError(
+                "STORE_TIMEZONE is not a valid timezone."
+            ) from None
+
+        now_local = datetime.now(store_tz)
+        start_local = now_local.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        end_local = start_local + timedelta(days=1)
+
+        # Convert local calendar-day boundaries to UTC instants.
+        # This also handles daylight-saving transitions correctly.
+        start_utc = start_local.astimezone(timezone.utc)
+        end_utc = end_local.astimezone(timezone.utc)
+
+        query["after"] = start_utc.isoformat()
+        query["before"] = end_utc.isoformat()
+
+    else:
+        if after:
+            query["after"] = _parse_datetime(after, "after").isoformat()
+
+        if before:
+            query["before"] = _parse_datetime(before, "before").isoformat()
+
+    result = await wc_request(
+        "GET",
+        "orders",
+        params=query,
+    )
+
+    if not isinstance(result, list):
+        raise RuntimeError("Unexpected response while listing orders.")
+
+    return [
+        {
+            "id": order.get("id"),
+            "number": order.get("number"),
+            "status": order.get("status"),
+            "date_created": order.get("date_created"),
+            "total": order.get("total"),
+            "currency": order.get("currency"),
+            "payment_method_title": order.get("payment_method_title"),
+            "line_items": [
+                {
+                    "product_id": item.get("product_id"),
+                    "name": item.get("name"),
+                    "quantity": item.get("quantity"),
+                    "total": item.get("total"),
+                }
+                for item in order.get("line_items", [])
+            ],
+        }
+        for order in result
+    ]
+
+
+# ---------------------------------------------------------
+# MCP tool 4: get_order
+# ---------------------------------------------------------
+
+@mcp.tool()
+async def get_order(order_id: int) -> dict:
+    """Retrieve details for a single WooCommerce order."""
+    if order_id <= 0:
+        raise ValueError("order_id must be a positive integer.")
+
+    order = await wc_request("GET", f"orders/{order_id}")
+
+    return {
+        "id": order.get("id"),
+        "number": order.get("number"),
+        "status": order.get("status"),
+        "date_created": order.get("date_created"),
+        "total": order.get("total"),
+        "currency": order.get("currency"),
+        "payment_method_title": order.get("payment_method_title"),
+        "billing": {
+            "first_name": order.get("billing", {}).get("first_name"),
+            "last_name": order.get("billing", {}).get("last_name"),
+        },
+        "line_items": [
+            {
+                "product_id": item.get("product_id"),
+                "name": item.get("name"),
+                "quantity": item.get("quantity"),
+                "total": item.get("total"),
+            }
+            for item in order.get("line_items", [])
+        ],
+    }
+
+
+# ---------------------------------------------------------
+# MCP tool 5: update_order_status
+# ---------------------------------------------------------
+
+@mcp.tool()
+async def update_order_status(
+    order_id: int,
+    status: str,
+) -> dict:
+    """Update an order to an allowed WooCommerce status."""
+    if order_id <= 0:
+        raise ValueError("order_id must be a positive integer.")
+
+    if not isinstance(status, str):
+        raise ValueError("status must be a string.")
+
+    status = status.strip().lower()
+
+    if status not in ALLOWED_ORDER_STATUSES:
+        raise ValueError(
+            "Unsupported status. Allowed values: "
+            f"{', '.join(sorted(ALLOWED_ORDER_STATUSES))}."
+        )
+
+    order = await wc_request(
+        "PUT",
+        f"orders/{order_id}",
+        payload={"status": status},
+    )
+
+    return {
+        "id": order.get("id"),
+        "number": order.get("number"),
+        "status": order.get("status"),
+    }
+
+
+# ---------------------------------------------------------
+# FastAPI application and health checks
+# ---------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with mcp.session_manager.run():
+        yield
+
+
+app = FastAPI(
+    title="WooCommerce MCP Server",
+    description="Custom MCP tools backed by the WooCommerce REST API",
+    version="1.1.0",
+    lifespan=lifespan,
+)
+
+
+@app.get("/health")
+async def health():
+    """Backward-compatible health endpoint."""
+    return {
+        "status": "healthy",
+        "service": "woocommerce-mcp",
+    }
+
+
+@app.get("/healthz")
+async def healthz():
+    """Liveness check: confirms the process is responding."""
+    return {
+        "status": "alive",
+        "service": "woocommerce-mcp",
+    }
+
+
+@app.get("/readyz")
+async def readyz():
+    """
+    Readiness check: confirms configuration and WooCommerce API access.
+    Returns HTTP 503 when the store cannot be reached or authenticated.
+    """
+    try:
+        await wc_request(
+            "GET",
+            "products",
+            params={"per_page": 1},
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "not_ready",
+                "reason": str(exc)[:300],
+            },
+        ) from None
+
+    return {
+        "status": "ready",
+        "service": "woocommerce-mcp",
+    }
+
+
+# Mount the MCP Streamable HTTP endpoint.
+app.mount("/", mcp.streamable_http_app())
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+========== servers\inventory-mcp\Dockerfile ==========
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+RUN pip install --no-cache-dir "mcp>=1.9,<2.0"
+COPY servers/inventory-mcp/app/main.py /app/main.py
+RUN useradd --create-home --uid 10001 appuser
+USER 10001
+EXPOSE 8000
+CMD ["python", "main.py"]
+
+========== servers\inventory-mcp\app\main.py ==========
+
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP(
+    "inventory-mcp",
+    host="0.0.0.0",
+    port=8003,
+    stateless_http=True,
+)
+
+INVENTORY = {
+    "DEMO-001": {"name": "Demo Product", "stock": 25},
+    "CABLE-002": {"name": "USB-C Cable", "stock": 100},
+}
+
+
+@mcp.tool()
+def check_stock(sku: str) -> dict:
+    """Check available inventory for a SKU."""
+    item = INVENTORY.get(sku.upper())
+    if item is None:
+        return {"found": False, "sku": sku}
+    return {"found": True, "sku": sku.upper(), **item}
+
+
+@mcp.tool()
+def list_inventory() -> list[dict]:
+    """List all inventory items."""
+    return [
+        {"sku": sku, **item}
+        for sku, item in INVENTORY.items()
+    ]
+
+
+if __name__ == "__main__":
+    mcp.run(transport="streamable-http")
+
+========== servers\notes-mcp\Dockerfile ==========
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+RUN pip install --no-cache-dir "mcp>=1.9,<2.0"
+COPY servers/notes-mcp/app/main.py /app/main.py
+RUN useradd --create-home --uid 10001 appuser
+USER 10001
+EXPOSE 8000
+CMD ["python", "main.py"]
+
+========== servers\notes-mcp\app\main.py ==========
+
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP(
+    "notes-mcp",
+    host="0.0.0.0",
+    port=8002,
+    stateless_http=True,
+)
+
+NOTES = {
+    1: {
+        "title": "Gateway setup",
+        "content": "The team MCP gateway routes requests to registered upstream servers.",
+    },
+    2: {
+        "title": "WooCommerce demo",
+        "content": "Use the storefront to place a test order with cash on delivery.",
+    },
+}
+
+
+@mcp.tool()
+def search_notes(query: str = "") -> list[dict]:
+    """Search notes by title or content."""
+    query_lower = query.lower()
+    return [
+        {"id": note_id, **note}
+        for note_id, note in NOTES.items()
+        if query_lower in note["title"].lower()
+        or query_lower in note["content"].lower()
+    ]
+
+
+@mcp.tool()
+def create_note(title: str, content: str) -> dict:
+    """Create a note and return its ID."""
+    note_id = max(NOTES.keys(), default=0) + 1
+    NOTES[note_id] = {"title": title, "content": content}
+    return {"id": note_id, **NOTES[note_id]}
+
+
+if __name__ == "__main__":
+    mcp.run(transport="streamable-http")
+
+========== frontend\Dockerfile ==========
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY frontend/package*.json ./
+RUN npm install
+COPY frontend/ ./
+ARG VITE_API_BASE_URL=http://gateway.local
+ARG VITE_GATEWAY_MCP_URL=http://gateway.local/mcp/mcp
+ENV VITE_API_BASE_URL=$VITE_API_BASE_URL
+ENV VITE_GATEWAY_MCP_URL=$VITE_GATEWAY_MCP_URL
+RUN npm run build
+
+FROM nginx:1.28-alpine
+COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /app/dist /usr/share/nginx/html
+EXPOSE 8080
+
+========== frontend\nginx.conf ==========
+server {
+    listen 8080;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+}
+
+========== frontend\package.json ==========
+{
+  "name": "frontend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "oxlint",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "lucide-react": "^1.61.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-router-dom": "^7.18.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "oxlint": "^1.88.0",
+    "typescript": "~6.0.3",
+    "vite": "^8.3.4"
+  }
+}
+
+========== frontend\src\api.ts ==========
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8081'
+
+/** URL that MCP clients (Claude Code, Cursor) connect to. */
+export const GATEWAY_MCP_URL: string =
+  import.meta.env.VITE_GATEWAY_MCP_URL ?? `${API_BASE_URL}/mcp/mcp`
+
+export type AuthMode = 'api-key' | 'admin-token'
+export type UserRole = 'admin' | 'member'
+export type UpstreamAuthMode = 'none' | 'bearer' | 'custom_header'
+
+export interface AuthConfig {
+  mode: AuthMode
+  credential: string
+}
+
+export interface UserProfile {
+  username: string
+  name: string
+  role: UserRole
+  user_id: string
+  email: string
+}
+
+/** Shape returned by GET /admin/upstreams (credentials are never included). */
+export interface Upstream {
+  name: string
+  url: string
+  enabled: boolean
+  created_at: string
+  auth_mode: UpstreamAuthMode
+  custom_header_name: string | null
+  timeout_seconds: number
+  connection_status: string
+  consecutive_failures: number
+  last_checked_at: string | null
+  last_success_at: string | null
+  last_discovery_at: string | null
+  last_error: string | null
+  circuit_open_until: string | null
+  hasCredential: boolean
+}
+
+/** Shape returned by GET /admin/upstream-status. */
+export interface UpstreamStatus {
+  name: string
+  enabled: boolean
+  status: string
+  consecutive_failures: number
+  last_checked_at: string | null
+  last_success_at: string | null
+  last_discovery_at: string | null
+  last_error: string | null
+  circuit_open_until: string | null
+}
+
+export interface GatewayTool {
+  gateway_name: string
+  upstream_server: string
+  upstream_tool: string
+}
+
+/** Tool details returned by GET /api/tools for any signed-in user. */
+export interface MemberTool extends GatewayTool {
+  description: string | null
+  input_schema: Record<string, unknown>
+}
+
+export interface UpstreamCreateInput {
+  name: string
+  url: string
+  enabled?: boolean
+  auth_mode?: UpstreamAuthMode
+  /** Omit for "no credential". Never read back from the server. */
+  credential?: string
+  custom_header_name?: string
+  timeout_seconds?: number
+}
+
+/**
+ * PATCH semantics on the backend:
+ *  - credential omitted  -> keep the stored credential
+ *  - credential ""       -> clear the stored credential
+ *  - credential "xyz"    -> replace it
+ */
+export type UpstreamUpdateInput = Partial<Omit<UpstreamCreateInput, 'name'>>
+
+/** GET /admin/users */
+export interface ApiUser {
+  user_id: string
+  username: string
+  email: string
+  role: UserRole
+  created_at: string
+  active_keys: number
+  total_keys: number
+  last_used_at: string | null
+}
+
+/** GET /admin/keys and GET /api/me/keys (admin list also has user fields). */
+export interface ApiKeyRecord {
+  key_id: number
+  user_id?: string
+  username?: string
+  label: string
+  key_prefix: string | null
+  created_at: string
+  last_used_at: string | null
+  revoked_at: string | null
+  revoked: number
+}
+
+/** Returned once when a key is created. The raw key is never available again. */
+export interface IssuedKey {
+  key_id: number
+  user_id: string
+  label: string
+  api_key: string
+  warning: string
+}
+
+export interface UserCreateInput {
+  username: string
+  email?: string
+  role: UserRole
+}
+
+export interface AuditEvent {
+  id: number
+  user_id: string
+  username: string | null
+  server_name: string
+  tool_name: string
+  started_at: string | null
+  timestamp: string
+  duration_ms: number
+  outcome: string
+  error_message: string | null
+}
+
+export interface AuditPageResult {
+  total: number
+  limit: number
+  offset: number
+  audit: AuditEvent[]
+}
+
+export interface AuditQuery {
+  username?: string
+  server_name?: string
+  tool_name?: string
+  outcome?: string
+  limit?: number
+  offset?: number
+}
+
+export class ApiError extends Error {
+  status: number
+
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
+let authConfig: AuthConfig = {
+  mode: 'api-key',
+  credential: '',
+}
+
+let unauthorizedHandler: (() => void) | null = null
+
+export function setAuth(config: AuthConfig) {
+  authConfig = {
+    mode: config.mode,
+    credential: config.credential.trim(),
+  }
+}
+
+export function getAuth() {
+  return authConfig
+}
+
+/** Called when any request (except /api/me) returns 401 while signed in. */
+export function setUnauthorizedHandler(handler: (() => void) | null) {
+  unauthorizedHandler = handler
+}
+
+function extractMessage(body: string, fallback: string): string {
+  if (!body) return fallback
+
+  try {
+    const parsed = JSON.parse(body)
+    const detail = parsed?.detail
+
+    if (typeof detail === 'string') return detail
+
+    // FastAPI/Pydantic validation errors (422)
+    if (Array.isArray(detail)) {
+      return detail
+        .map((item) => {
+          const where = Array.isArray(item?.loc)
+            ? item.loc.filter((part: unknown) => part !== 'body').join('.')
+            : ''
+          return where ? `${where}: ${item?.msg}` : String(item?.msg ?? item)
+        })
+        .join('; ')
+    }
+
+    if (typeof parsed?.message === 'string') return parsed.message
+  } catch {
+    // Not JSON; fall through to the raw text.
+  }
+
+  return body.slice(0, 300)
+}
+
+export async function apiRequest<T>(
+  path: string,
+  options: RequestInit = {},
+): Promise<T> {
+  const headers = new Headers(options.headers)
+
+  headers.set('Accept', 'application/json')
+
+  if (options.body && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+
+  // Remove stale credentials before applying the active credential.
+  headers.delete('X-Admin-Token')
+  headers.delete('X-API-Key')
+  headers.delete('Authorization')
+
+  const credential = authConfig.credential.trim()
+  const isAdminEndpoint = path === '/admin' || path.startsWith('/admin/')
+  const isHealthEndpoint = path === '/health'
+
+  if (credential && !isHealthEndpoint) {
+    if (authConfig.mode === 'admin-token' && isAdminEndpoint) {
+      headers.set('X-Admin-Token', credential)
+    } else if (authConfig.mode === 'api-key') {
+      headers.set('X-API-Key', credential)
+    }
+  }
+
+  let response: Response
+
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      ...options,
+      headers,
+    })
+  } catch {
+    throw new ApiError(
+      0,
+      `Cannot reach the gateway${API_BASE_URL ? ` at ${API_BASE_URL}` : ''}.`,
+    )
+  }
+
+  if (!response.ok) {
+    const body = await response.text()
+    const message = extractMessage(body, response.statusText)
+
+    if (
+      response.status === 401 &&
+      credential &&
+      path !== '/api/me' &&
+      unauthorizedHandler
+    ) {
+      unauthorizedHandler()
+    }
+
+    throw new ApiError(response.status, message)
+  }
+
+  if (response.status === 204) {
+    return undefined as T
+  }
+
+  return response.json() as Promise<T>
+}
+
+export const api = {
+  health: () =>
+    apiRequest<{
+      status: string
+      service?: string
+      registered_tools?: number
+    }>('/health'),
+
+  me: () => apiRequest<Record<string, unknown>>('/api/me'),
+
+  // ---- MCP servers (admin) ----
+  upstreams: () =>
+    apiRequest<{ upstreams: Upstream[] }>('/admin/upstreams'),
+
+  upstreamStatus: () =>
+    apiRequest<{ upstreams: UpstreamStatus[] }>('/admin/upstream-status'),
+
+  // Admin-only tool listing for the Servers page.
+  tools: () => apiRequest<{ tools: GatewayTool[] }>('/admin/tools'),
+
+  // Any signed-in user (admin or member).
+  // Includes tool descriptions and input schemas.
+  myTools: () => apiRequest<{ tools: MemberTool[] }>('/api/tools'),
+
+  createUpstream: (input: UpstreamCreateInput) =>
+    apiRequest<unknown>('/admin/upstreams', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  // The backend exposes PATCH (not PUT) for edits and enable/disable.
+  updateUpstream: (name: string, input: UpstreamUpdateInput) =>
+    apiRequest<unknown>(`/admin/upstreams/${encodeURIComponent(name)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(input),
+    }),
+
+  deleteUpstream: (name: string) =>
+    apiRequest<unknown>(`/admin/upstreams/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    }),
+
+  refreshTools: () =>
+    apiRequest<{ upstreams_discovered: number; tools_registered: number }>(
+      '/admin/refresh-tools',
+      { method: 'POST' },
+    ),
+
+  // ---- Team members (admin) ----
+  listUsers: () => apiRequest<{ users: ApiUser[] }>('/admin/users'),
+
+  createUser: (input: UserCreateInput) =>
+    apiRequest<{ user_id: string; username: string; role: UserRole }>(
+      '/admin/users',
+      { method: 'POST', body: JSON.stringify(input) },
+    ),
+
+  updateUserRole: (userId: string, role: UserRole) =>
+    apiRequest<{ user_id: string; role: UserRole }>(
+      `/admin/users/${encodeURIComponent(userId)}`,
+      { method: 'PATCH', body: JSON.stringify({ role }) },
+    ),
+
+  deleteUser: (userId: string) =>
+    apiRequest<{ message: string }>(
+      `/admin/users/${encodeURIComponent(userId)}`,
+      { method: 'DELETE' },
+    ),
+
+  // ---- API keys (admin: any user) ----
+  // `adminKeys` is the method name used by the Team & API Keys page.
+  // Keep `listKeys` as an alias for compatibility with any existing callers.
+  adminKeys: () => apiRequest<{ keys: ApiKeyRecord[] }>('/admin/keys'),
+  listKeys: () => apiRequest<{ keys: ApiKeyRecord[] }>('/admin/keys'),
+
+  createKey: (userId: string, label = 'default') =>
+    apiRequest<IssuedKey>(
+      `/admin/users/${encodeURIComponent(userId)}/keys`,
+      { method: 'POST', body: JSON.stringify({ label }) },
+    ),
+
+  revokeKey: (keyId: number) =>
+    apiRequest<{ message: string }>(`/admin/keys/${keyId}/revoke`, {
+      method: 'POST',
+    }),
+
+  // ---- API keys (any signed-in user: own keys only) ----
+  myKeys: () => apiRequest<{ keys: ApiKeyRecord[] }>('/api/me/keys'),
+
+  createMyKey: (label = 'default') =>
+    apiRequest<IssuedKey>('/api/me/keys', {
+      method: 'POST',
+      body: JSON.stringify({ label }),
+    }),
+
+  revokeMyKey: (keyId: number) =>
+    apiRequest<{ message: string }>(`/api/me/keys/${keyId}/revoke`, {
+      method: 'POST',
+    }),
+
+  // ---- Audit (admin) ----
+  audit: (query: AuditQuery = {}) => {
+    const params = new URLSearchParams()
+
+    for (const [key, value] of Object.entries(query)) {
+      if (value !== undefined && value !== '') {
+        params.set(key, String(value))
+      }
+    }
+
+    return apiRequest<AuditPageResult>(`/admin/audit?${params.toString()}`)
+  },
+
+  // ---- Chat (any signed-in user) ----
+  chat: (message: string, history?: Array<Record<string, string>>) =>
+    apiRequest<unknown>('/api/chat', {
+      method: 'POST',
+      body: JSON.stringify({ message, history }),
+    }),
+}
+
+========== deploy\helm\charts\wordpress\values.yaml ==========
+
+wordpressUsername: admin
+wordpressBlogName: Team MCP Store
+
+service:
+  type: ClusterIP
+
+ingress:
+  enabled: true
+  ingressClassName: nginx
+  hostname: shop.localhost
+  path: /
+  pathType: Prefix
+  annotations: {}
+
+persistence:
+  enabled: true
+  size: 2Gi
+
+mariadb:
+  enabled: true
+  auth:
+    database: wordpress
+  primary:
+    persistence:
+      enabled: true
+      size: 2Gi
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+========== ROOT CONFIG FILE NAMES ==========
+.env.example

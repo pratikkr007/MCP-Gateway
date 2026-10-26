@@ -1,0 +1,861 @@
+
+import asyncio
+import inspect
+import logging
+import os
+import re
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+from mcp.server.fastmcp import FastMCP
+from pydantic import BaseModel, Field
+
+from backend.app.security import (
+    GatewayAuthMiddleware,
+    init_db,
+    create_user,
+    issue_api_key,
+    revoke_api_key,
+    connect_db,
+    current_user_id,
+    current_user_role,
+    current_username,
+    write_audit,
+    load_upstreams,
+    save_upstream,
+    delete_upstream_record,
+)
+
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+load_dotenv(ROOT_DIR / ".env")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("mcp-gateway")
+
+DEFAULT_UPSTREAMS = {
+    "woocommerce": os.getenv(
+        "WOOCOMMERCE_MCP_URL",
+        "http://127.0.0.1:8000/mcp",
+    ),
+    "notes": os.getenv(
+        "NOTES_MCP_URL",
+        "http://127.0.0.1:8002/mcp",
+    ),
+    "inventory": os.getenv(
+        "INVENTORY_MCP_URL",
+        "http://127.0.0.1:8003/mcp",
+    ),
+}
+
+UPSTREAMS: dict[str, str] = {}
+UPSTREAM_ENABLED: dict[str, bool] = {}
+UPSTREAM_TIMEOUT_SECONDS = 15
+
+TOOL_ROUTES: dict[str, dict[str, str]] = {}
+REGISTRATION_LOCK = asyncio.Lock()
+
+
+# --------------------------------------------------
+# Gateway MCP server
+# --------------------------------------------------
+
+gateway_mcp = FastMCP(
+    "team-mcp-gateway",
+    host="0.0.0.0",
+    port=8081,
+    stateless_http=True,
+)
+
+
+# --------------------------------------------------
+# MCP upstream helpers
+# --------------------------------------------------
+
+async def discover_upstream_tools(server_name: str, url: str):
+    """Discover tools exposed by an upstream MCP server."""
+    async with streamablehttp_client(url) as (
+        read_stream,
+        write_stream,
+        _,
+    ):
+        async with ClientSession(
+            read_stream,
+            write_stream,
+        ) as session:
+            await asyncio.wait_for(
+                session.initialize(),
+                timeout=UPSTREAM_TIMEOUT_SECONDS,
+            )
+
+            result = await asyncio.wait_for(
+                session.list_tools(),
+                timeout=UPSTREAM_TIMEOUT_SECONDS,
+            )
+
+            return result.tools
+
+
+async def call_upstream(
+    server_name: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+):
+    """Call a tool on its original upstream MCP server."""
+    if server_name not in UPSTREAMS:
+        raise RuntimeError(
+            f"Unknown upstream server: {server_name}"
+        )
+
+    if not UPSTREAM_ENABLED.get(server_name, False):
+        raise RuntimeError(
+            f"Upstream server '{server_name}' is disabled"
+        )
+
+    url = UPSTREAMS[server_name]
+
+    async with streamablehttp_client(url) as (
+        read_stream,
+        write_stream,
+        _,
+    ):
+        async with ClientSession(
+            read_stream,
+            write_stream,
+        ) as session:
+            await asyncio.wait_for(
+                session.initialize(),
+                timeout=UPSTREAM_TIMEOUT_SECONDS,
+            )
+
+            result = await asyncio.wait_for(
+                session.call_tool(tool_name, arguments),
+                timeout=UPSTREAM_TIMEOUT_SECONDS,
+            )
+
+            return {
+                "isError": result.isError,
+                "content": [
+                    item.model_dump(mode="json")
+                    for item in result.content
+                ],
+            }
+
+
+# --------------------------------------------------
+# Dynamic tool registration
+# --------------------------------------------------
+
+def safe_tool_name(name: str) -> str:
+    """Convert a name into a predictable identifier."""
+    normalized = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+    return normalized.strip("_") or "unnamed_tool"
+
+
+def make_proxy(
+    server_name: str,
+    upstream_tool_name: str,
+    input_schema: dict,
+):
+    """Create a dynamically typed proxy for an upstream tool."""
+    properties = input_schema.get("properties", {})
+    required_fields = set(input_schema.get("required", []))
+
+    parameters = []
+
+    for name, details in properties.items():
+        schema_type = details.get("type", "string")
+
+        type_mapping = {
+            "string": str,
+            "integer": int,
+            "number": float,
+            "boolean": bool,
+            "object": dict,
+            "array": list,
+        }
+
+        annotation = type_mapping.get(schema_type, Any)
+
+        if name in required_fields:
+            default = inspect.Parameter.empty
+        else:
+            if "default" in details:
+                default = details["default"]
+            elif schema_type == "integer":
+                default = 10 if name == "per_page" else None
+            else:
+                default = None
+
+            if default is None:
+                annotation = Any
+
+        parameters.append(
+            inspect.Parameter(
+                name=name,
+                kind=inspect.Parameter.KEYWORD_ONLY,
+                default=default,
+                annotation=annotation,
+            )
+        )
+
+    async def proxy(**arguments):
+        arguments = {
+            key: value
+            for key, value in arguments.items()
+            if value is not None
+        }
+
+        started = time.perf_counter()
+        outcome = "success"
+        error_message = None
+
+        user_id = current_user_id.get()
+        username = current_username.get()
+
+        try:
+            result = await call_upstream(
+                server_name,
+                upstream_tool_name,
+                arguments,
+            )
+
+            if result.get("isError"):
+                outcome = "error"
+                error_message = "Upstream tool returned an error"
+
+            return result
+
+        except Exception as exc:
+            outcome = "error"
+            error_message = str(exc)[:500]
+            raise
+
+        finally:
+            duration_ms = int(
+                (time.perf_counter() - started) * 1000
+            )
+
+            try:
+                write_audit(
+                    user_id=user_id,
+                    username=username,
+                    server_name=server_name,
+                    tool_name=upstream_tool_name,
+                    duration_ms=duration_ms,
+                    outcome=outcome,
+                    error_message=error_message,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to write MCP tool audit record"
+                )
+
+    proxy.__name__ = f"{server_name}_{upstream_tool_name}"
+    proxy.__doc__ = f"Proxy for {server_name}.{upstream_tool_name}"
+    proxy.__signature__ = inspect.Signature(parameters)
+
+    return proxy
+
+
+async def refresh_upstream_tools() -> dict[str, int]:
+    """
+    Discover enabled upstream tools independently.
+
+    A temporary failure does not stop healthy upstreams from working.
+    """
+    discovered: dict[str, list[Any]] = {}
+
+    for server_name, url in list(UPSTREAMS.items()):
+        if not UPSTREAM_ENABLED.get(server_name, False):
+            continue
+
+        try:
+            tools = await discover_upstream_tools(server_name, url)
+            discovered[server_name] = tools
+
+            logger.info(
+                "Discovered %d tools from upstream '%s'",
+                len(tools),
+                server_name,
+            )
+
+        except Exception:
+            logger.exception(
+                "Could not discover tools from upstream '%s'",
+                server_name,
+            )
+
+    registered_count = 0
+
+    async with REGISTRATION_LOCK:
+        for server_name, tools in discovered.items():
+            new_routes: dict[str, dict[str, str]] = {}
+
+            for upstream_tool in tools:
+                gateway_name = (
+                    f"{safe_tool_name(server_name)}__"
+                    f"{safe_tool_name(upstream_tool.name)}"
+                )
+
+                route = {
+                    "server": server_name,
+                    "tool": upstream_tool.name,
+                }
+
+                existing = TOOL_ROUTES.get(gateway_name)
+
+                if existing and existing != route:
+                    logger.error(
+                        "Tool name collision for '%s'",
+                        gateway_name,
+                    )
+                    continue
+
+                if existing == route:
+                    new_routes[gateway_name] = route
+                    registered_count += 1
+                    continue
+
+                try:
+                    proxy = make_proxy(
+                        server_name,
+                        upstream_tool.name,
+                        upstream_tool.inputSchema,
+                    )
+
+                    gateway_mcp.add_tool(
+                        proxy,
+                        name=gateway_name,
+                        description=(
+                            upstream_tool.description
+                            or f"Proxy for {upstream_tool.name}"
+                        ),
+                    )
+
+                    new_routes[gateway_name] = route
+                    registered_count += 1
+
+                except Exception:
+                    logger.exception(
+                        "Could not register tool '%s'",
+                        gateway_name,
+                    )
+
+            # Remove stale tools only after successful discovery.
+            old_names = [
+                name
+                for name, route in TOOL_ROUTES.items()
+                if route["server"] == server_name
+                and name not in new_routes
+            ]
+
+            for old_name in old_names:
+                gateway_mcp.remove_tool(old_name)
+                TOOL_ROUTES.pop(old_name, None)
+
+            TOOL_ROUTES.update(new_routes)
+
+        # Remove tools belonging to disabled or deleted upstreams.
+        inactive_names = [
+            name
+            for name, route in TOOL_ROUTES.items()
+            if route["server"] not in UPSTREAMS
+            or not UPSTREAM_ENABLED.get(route["server"], False)
+        ]
+
+        for name in inactive_names:
+            gateway_mcp.remove_tool(name)
+            TOOL_ROUTES.pop(name, None)
+
+    return {
+        "upstreams_discovered": len(discovered),
+        "tools_registered": registered_count,
+    }
+
+
+# --------------------------------------------------
+# Upstream models and validation
+# --------------------------------------------------
+
+class UpstreamCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=50)
+    url: str = Field(min_length=1, max_length=500)
+    enabled: bool = True
+
+
+class UpstreamUpdate(BaseModel):
+    url: str | None = Field(default=None, max_length=500)
+    enabled: bool | None = None
+
+
+def validate_upstream_url(url: str) -> str:
+    """Validate an HTTP or HTTPS upstream URL."""
+    url = url.strip()
+    parsed = urlparse(url)
+
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Provide a valid HTTP or HTTPS URL "
+                "without embedded credentials"
+            ),
+        )
+
+    return url.rstrip("/")
+
+
+# --------------------------------------------------
+# Persistent upstream configuration
+# --------------------------------------------------
+
+def load_saved_upstreams():
+    """Load upstream configurations from SQLite."""
+    saved = load_upstreams()
+
+    if not saved:
+        for name, url in DEFAULT_UPSTREAMS.items():
+            save_upstream(
+                name=name,
+                url=url,
+                enabled=True,
+            )
+
+        saved = load_upstreams()
+
+    UPSTREAMS.clear()
+    UPSTREAM_ENABLED.clear()
+
+    for upstream in saved:
+        UPSTREAMS[upstream["name"]] = upstream["url"]
+        UPSTREAM_ENABLED[upstream["name"]] = upstream["enabled"]
+
+    logger.info(
+        "Loaded %d persisted upstream configurations",
+        len(saved),
+    )
+
+
+# --------------------------------------------------
+# Application lifecycle
+# --------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    load_saved_upstreams()
+
+    await refresh_upstream_tools()
+
+    async with gateway_mcp.session_manager.run():
+        yield
+
+
+# --------------------------------------------------
+# FastAPI application
+# --------------------------------------------------
+
+app = FastAPI(
+    title="MCP Gateway",
+    description="Dynamic gateway for multiple MCP servers",
+    version="0.8.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(GatewayAuthMiddleware)
+
+
+# --------------------------------------------------
+# User and API-key administration models
+# --------------------------------------------------
+
+class UserCreate(BaseModel):
+    username: str = Field(min_length=2, max_length=80)
+    email: str | None = Field(default=None, max_length=254)
+    role: str = Field(
+        default="member",
+        pattern="^(admin|member)$",
+    )
+
+
+class KeyCreate(BaseModel):
+    label: str = Field(
+        default="default",
+        min_length=1,
+        max_length=80,
+    )
+
+
+# --------------------------------------------------
+# Admin user and API-key endpoints
+# --------------------------------------------------
+
+@app.post("/admin/users", status_code=201)
+async def admin_create_user(payload: UserCreate):
+    try:
+        user_id = create_user(
+            payload.username,
+            payload.role,
+            payload.email,
+        )
+    except Exception as exc:
+        if "UNIQUE constraint failed" in str(exc):
+            raise HTTPException(
+                status_code=409,
+                detail="Username or email already exists",
+            ) from exc
+
+        if isinstance(exc, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail=str(exc),
+            ) from exc
+
+        raise
+
+    return {
+        "user_id": user_id,
+        "username": payload.username,
+        "role": payload.role,
+    }
+
+
+@app.post("/admin/users/{user_id}/keys", status_code=201)
+async def admin_issue_key(user_id: str, payload: KeyCreate):
+    try:
+        return issue_api_key(user_id, payload.label)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc),
+        ) from exc
+
+
+@app.get("/admin/keys")
+async def admin_list_keys():
+    with connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                k.id AS key_id,
+                k.user_id,
+                u.username,
+                k.label,
+                k.created_at,
+                k.revoked_at,
+                k.revoked
+            FROM api_keys AS k
+            JOIN users AS u ON u.id = k.user_id
+            ORDER BY k.id DESC
+            LIMIT 500
+            """
+        ).fetchall()
+
+    return {"keys": [dict(row) for row in rows]}
+
+
+@app.post("/admin/keys/{key_id}/revoke")
+async def admin_revoke_key(key_id: int):
+    if not revoke_api_key(key_id):
+        raise HTTPException(
+            status_code=404,
+            detail="Active API key not found",
+        )
+
+    return {
+        "message": "API key revoked",
+        "key_id": key_id,
+    }
+
+
+# --------------------------------------------------
+# Member self-service API-key endpoints
+# --------------------------------------------------
+
+@app.get("/api/me")
+async def get_current_member():
+    """Return the identity associated with the supplied API key."""
+    return {
+        "user_id": current_user_id.get(),
+        "username": current_username.get(),
+        "role": current_user_role.get(),
+    }
+
+
+@app.get("/api/me/keys")
+async def list_my_api_keys():
+    """List only API keys belonging to the authenticated user."""
+    user_id = current_user_id.get()
+
+    with connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                id AS key_id,
+                label,
+                created_at,
+                revoked_at,
+                revoked
+            FROM api_keys
+            WHERE user_id = ?
+            ORDER BY id DESC
+            """,
+            (user_id,),
+        ).fetchall()
+
+    return {"keys": [dict(row) for row in rows]}
+
+
+@app.post("/api/me/keys", status_code=201)
+async def create_my_api_key(payload: KeyCreate):
+    """Create an API key for the authenticated user."""
+    user_id = current_user_id.get()
+
+    try:
+        return issue_api_key(user_id, payload.label)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+
+@app.post("/api/me/keys/{key_id}/revoke")
+async def revoke_my_api_key(key_id: int):
+    """Revoke a key only if it belongs to the authenticated user."""
+    user_id = current_user_id.get()
+
+    with connect_db() as conn:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM api_keys
+            WHERE id = ? AND user_id = ? AND revoked = 0
+            """,
+            (key_id, user_id),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Active API key not found",
+        )
+
+    if not revoke_api_key(key_id):
+        raise HTTPException(
+            status_code=409,
+            detail="API key could not be revoked",
+        )
+
+    return {
+        "message": "API key revoked",
+        "key_id": key_id,
+    }
+
+
+# --------------------------------------------------
+# Audit endpoints
+# --------------------------------------------------
+
+@app.get("/admin/audit")
+async def admin_audit(limit: int = 100):
+    limit = max(1, min(limit, 500))
+
+    with connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                user_id,
+                username,
+                server_name,
+                tool_name,
+                started_at,
+                duration_ms,
+                outcome,
+                error_message
+            FROM audit_logs
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    return {"audit": [dict(row) for row in rows]}
+
+
+# --------------------------------------------------
+# Health and tool endpoints
+# --------------------------------------------------
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "service": "mcp-gateway",
+        "registered_tools": len(TOOL_ROUTES),
+    }
+
+
+@app.post("/admin/refresh-tools")
+async def refresh_tools_endpoint():
+    return await refresh_upstream_tools()
+
+
+@app.get("/admin/tools")
+async def list_registered_tools():
+    return {
+        "tools": [
+            {
+                "gateway_name": name,
+                "upstream_server": route["server"],
+                "upstream_tool": route["tool"],
+            }
+            for name, route in sorted(TOOL_ROUTES.items())
+        ]
+    }
+
+
+# --------------------------------------------------
+# Upstream management endpoints
+# --------------------------------------------------
+
+@app.get("/admin/upstreams")
+async def list_upstreams():
+    return {"upstreams": load_upstreams()}
+
+
+@app.post("/admin/upstreams", status_code=201)
+async def add_upstream(payload: UpstreamCreate):
+    name = safe_tool_name(payload.name)
+
+    if len(name) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Upstream name must contain at least two valid characters",
+        )
+
+    if name in UPSTREAMS:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Upstream '{name}' already exists",
+        )
+
+    url = validate_upstream_url(payload.url)
+
+    try:
+        save_upstream(
+            name=name,
+            url=url,
+            enabled=payload.enabled,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    UPSTREAMS[name] = url
+    UPSTREAM_ENABLED[name] = payload.enabled
+
+    result = await refresh_upstream_tools()
+
+    return {
+        "message": "Upstream added",
+        "name": name,
+        "enabled": payload.enabled,
+        **result,
+    }
+
+
+@app.patch("/admin/upstreams/{name}")
+async def update_upstream(name: str, payload: UpstreamUpdate):
+    if name not in UPSTREAMS:
+        raise HTTPException(
+            status_code=404,
+            detail="Upstream not found",
+        )
+
+    new_url = (
+        validate_upstream_url(payload.url)
+        if payload.url is not None
+        else UPSTREAMS[name]
+    )
+
+    new_enabled = (
+        payload.enabled
+        if payload.enabled is not None
+        else UPSTREAM_ENABLED.get(name, False)
+    )
+
+    save_upstream(
+        name=name,
+        url=new_url,
+        enabled=new_enabled,
+    )
+
+    UPSTREAMS[name] = new_url
+    UPSTREAM_ENABLED[name] = new_enabled
+
+    result = await refresh_upstream_tools()
+
+    return {
+        "message": "Upstream updated",
+        "name": name,
+        "url": UPSTREAMS[name],
+        "enabled": UPSTREAM_ENABLED[name],
+        **result,
+    }
+
+
+@app.delete("/admin/upstreams/{name}")
+async def delete_upstream(name: str):
+    if name not in UPSTREAMS:
+        raise HTTPException(
+            status_code=404,
+            detail="Upstream not found",
+        )
+
+    del UPSTREAMS[name]
+    UPSTREAM_ENABLED.pop(name, None)
+    delete_upstream_record(name)
+
+    async with REGISTRATION_LOCK:
+        old_names = [
+            tool_name
+            for tool_name, route in TOOL_ROUTES.items()
+            if route["server"] == name
+        ]
+
+        for tool_name in old_names:
+            gateway_mcp.remove_tool(tool_name)
+            TOOL_ROUTES.pop(tool_name, None)
+
+    return {
+        "message": "Upstream removed",
+        "name": name,
+        "removed_tools": len(old_names),
+    }
+
+
+# MCP endpoint: http://127.0.0.1:8081/mcp/mcp
+app.mount(
+    "/mcp",
+    gateway_mcp.streamable_http_app(),
+)

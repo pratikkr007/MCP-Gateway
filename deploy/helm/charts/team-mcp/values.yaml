@@ -1,0 +1,80 @@
+services:
+  gateway:
+    image: { repository: team-mcp-gateway, tag: local }
+    port: 8081
+    secretEnv:
+      - ADMIN_BOOTSTRAP_TOKEN
+      - LLM_API_KEY
+      - LLM_BASE_URL
+      - LLM_MODEL
+      - UPSTREAM_CREDENTIALS_KEY
+      - UPSTREAM_ALLOWED_HOSTS
+      - UPSTREAM_CIRCUIT_OPEN_SECONDS
+      - UPSTREAM_CONNECT_TIMEOUT_SECONDS
+      - UPSTREAM_DISCOVERY_TIMEOUT_SECONDS
+      - UPSTREAM_FAILURE_THRESHOLD
+      - UPSTREAM_HEALTH_CHECK_INTERVAL_SECONDS
+      - UPSTREAM_TOOL_TIMEOUT_SECONDS
+    env:
+      - { name: GATEWAY_DB_PATH, value: /app/data/gateway.db }
+      - { name: GATEWAY_MCP_URL, value: http://gateway:8081/mcp/mcp }
+      - { name: WOOCOMMERCE_MCP_URL, value: http://woocommerce-mcp:8000/mcp }
+      - { name: NOTES_MCP_URL, value: http://notes-mcp:8002/mcp }
+      - { name: INVENTORY_MCP_URL, value: http://inventory-mcp:8003/mcp }
+      - { name: CORS_ORIGINS, value: "http://dashboard.local:8080,http://localhost:5173,http://127.0.0.1:5173,http://localhost:18080" }
+    persistence: true
+    liveness: { type: http, path: /healthz }
+    readiness: { type: http, path: /readyz }
+
+  woocommerce-mcp:
+    image: { repository: team-mcp-woocommerce, tag: local }
+    port: 8000
+    secretEnv:
+      - WOOCOMMERCE_CONSUMER_KEY
+      - WOOCOMMERCE_CONSUMER_SECRET
+    env:
+      - { name: WOOCOMMERCE_URL, value: http://wordpress.team-mcp.svc.cluster.local }
+      - { name: WOOCOMMERCE_TIMEOUT, value: "20" }
+      - { name: STORE_TIMEZONE, value: Asia/Kolkata }
+    liveness: { type: http, path: /healthz }
+    readiness: { type: http, path: /readyz }
+
+  inventory-mcp:
+    image: { repository: team-mcp-inventory, tag: local }
+    port: 8003
+    liveness: { type: tcp }
+    readiness: { type: tcp }
+
+  notes-mcp:
+    image: { repository: team-mcp-notes, tag: local }
+    port: 8002
+    liveness: { type: tcp }
+    readiness: { type: tcp }
+
+  dashboard:
+    image: { repository: team-mcp-dashboard, tag: local }
+    port: 8080
+    liveness: { type: http, path: /healthz }
+    readiness: { type: http, path: /healthz }
+
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClassName: standard
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+ingress:
+  enabled: true
+  className: nginx
+  dashboardHost: dashboard.local
+  gatewayHost: gateway.local
+
+
+woocommerceOAuthUrl: "http://wordpress.local:8080"

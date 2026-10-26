@@ -1,0 +1,19 @@
+﻿imagePullPolicy: IfNotPresent
+
+secret:
+  name: team-mcp-secrets
+  
+woocommerceOAuthUrl: "http://wordpress.local:8080"
+
+ingress:
+  enabled: true
+  className: nginx
+  dashboardHost: dashboard.local
+  gatewayHost: gateway.local
+  storefrontHost: wordpress.local
+  annotations: {}
+
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClassName: standard

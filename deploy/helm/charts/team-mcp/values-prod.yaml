@@ -1,0 +1,27 @@
+﻿imagePullPolicy: IfNotPresent
+
+secret:
+  name: team-mcp-secrets
+
+woocommerceOAuthUrl: https://shop.example.com
+
+ingress:
+  enabled: true
+  className: nginx
+  dashboardHost: dashboard.example.com
+  gatewayHost: gateway.example.com
+  storefrontHost: shop.example.com
+  annotations: {}
+
+persistence:
+  enabled: true
+  size: 5Gi
+  storageClassName: ""
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
